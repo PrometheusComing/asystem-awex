@@ -1,0 +1,32 @@
+.whl
+**/.cache
+**/__pycache__/
+awex.egg-info
+**/*.prof
+**/*.pyc
+testresult
+**/target/**/**
+**/test-output
+**/.code/
+**/*.iml
+**/*.html
+.DS_Store
+**/.DS_Store
+.vscode/
+
+**/target/
+# Python
+python/build/
+python/dist/
+**/build/
+**/dist/
+
+# JavaScript/Node.js
+**/node_modules/
+# General build artifacts
+build/
+dist/
+**/.ruff_cache
+**/.pytest_cache
+.venv
+**/.idea
