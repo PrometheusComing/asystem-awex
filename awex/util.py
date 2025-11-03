@@ -298,3 +298,52 @@ def compute_statistics(stage_history: dict, step_id: int, duration: float, stage
         f"{stage} time statistics for step {step_id}: average time: {avg_time:.4f} seconds, median time: {median_time:.4f} seconds, "
         f"min time: {min_time:.4f} seconds,  max time: {max_time:.4f} seconds"
     )
+
+
+def check_train_infer_params_meta(
+    training_params_meta: List,
+    infer_parameters_meta: List,
+    raise_exception: bool = False,
+):
+    infer_meta = {param_meta.name: param_meta for param_meta in infer_parameters_meta}
+    train_meta = {param_meta.name: param_meta for param_meta in training_params_meta}
+    common_params = set(infer_meta.keys()) & set(train_meta.keys())
+    if len(common_params) != len(infer_meta) or len(common_params) != len(train_meta):
+        if len(train_meta) > len(infer_meta):
+            diff = set(train_meta.keys()) - common_params
+        else:
+            diff = set(infer_meta.keys()) - common_params
+        logger.error(
+            f"Inconsistent parameters meta: "
+            f"train {len(train_meta)} infer {len(infer_meta)} diff keys {diff}"
+        )
+        if raise_exception:
+            raise ValueError(
+                f"Inconsistent parameters meta for inference and training: "
+                f"{len(common_params)} {len(infer_meta)} {len(train_meta)}, diff keys {diff}"
+            )
+    for param_name in common_params:
+        infer_param_meta = infer_meta[param_name]
+        train_param_meta = train_meta[param_name]
+        if infer_param_meta.global_numel != train_param_meta.global_numel:
+            error_msg = (
+                f"Inconsistent number of elements for parameter {param_name}: "
+                f"{infer_param_meta.global_numel} != {train_param_meta.global_numel}"
+            )
+            if raise_exception:
+                raise ValueError(error_msg)
+            else:
+                logger.error(error_msg)
+        if infer_param_meta.global_shape != train_param_meta.global_shape:
+            error_msg = f"Inconsistent shape for parameter {param_name}: {infer_param_meta.global_shape} != {train_param_meta.global_shape}"
+            if raise_exception:
+                raise ValueError(error_msg)
+            else:
+                logger.error(error_msg)
+        if infer_param_meta.dtype != train_param_meta.dtype:
+            error_msg = f"Inconsistent dtype for parameter {param_name}: {infer_param_meta.dtype} != {train_param_meta.dtype}"
+            if raise_exception:
+                raise ValueError(error_msg)
+            else:
+                logger.error(error_msg)
+
