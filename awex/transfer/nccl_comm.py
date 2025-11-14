@@ -29,17 +29,11 @@ class NcclColocateTransport:
         weights_update_group,
         send_parameters,
         recv_parameters,
-        *,
-        group_size=None,
-        enable_debug_mode=False,
-        use_async_p2p=False
     ):
         logger.info(f"train_to_infer_device_mapping {train_to_infer_device_mapping}")
         logger.info(f"infer_to_train_device_mapping {infer_to_train_device_mapping}")
-        logger.info(f"P2P mode: {'async (individual isend/irecv)' if use_async_p2p else 'sync (send/recv)'}")
         validate_rank_mappings(train_to_infer_device_mapping, infer_to_train_device_mapping)
         start_time = time.time()
-        group_size = world_size
         send_ops = dict(send_transfer_plan.operations)
         recv_ops = dict(recv_transfer_plan.operations)
         num_sends = sum(len(ops) for ops in send_ops.values())
@@ -136,10 +130,10 @@ class NcclColocateTransport:
                 # Phase 1: Partition 0 sends, partition 1 receives
                 if partition == 0:
                     if send_ops:
-                        execute_p2p_op_list(send_ops, f"p2p send for {stage_name}", weights_update_group, use_async_p2p)
+                        execute_p2p_op_list(send_ops, f"p2p send for {stage_name}", weights_update_group)
                 else:
                     if recv_ops:
-                        execute_p2p_op_list(recv_ops, f"p2p recv for {stage_name}", weights_update_group, use_async_p2p)
+                        execute_p2p_op_list(recv_ops, f"p2p recv for {stage_name}", weights_update_group)
 
                 # Global barrier after Phase 1 to ensure all ranks complete before Phase 2
                 # This is necessary because NCCL might have internal state that requires synchronization
@@ -148,10 +142,10 @@ class NcclColocateTransport:
                 # Phase 2: Partition 0 receives, partition 1 sends
                 if partition == 0:
                     if recv_ops:
-                        execute_p2p_op_list(recv_ops, f"p2p recv for {stage_name}", weights_update_group, use_async_p2p)
+                        execute_p2p_op_list(recv_ops, f"p2p recv for {stage_name}", weights_update_group)
                 else:
                     if send_ops:
-                        execute_p2p_op_list(send_ops, f"p2p send for {stage_name}", weights_update_group, use_async_p2p)
+                        execute_p2p_op_list(send_ops, f"p2p send for {stage_name}", weights_update_group)
 
                 # Global barrier after Phase 2 to ensure all ranks complete before next stage
                 dist.barrier(group=weights_update_group)
@@ -256,7 +250,7 @@ def get_stack_trace(pid):
         return None
 
 
-def execute_p2p_op_list(p2p_op_list, stage: str, weights_update_group, use_async=False):
+def execute_p2p_op_list(p2p_op_list, stage: str, weights_update_group):
     start_time = time.time()
     num_ops = len(p2p_op_list)
 
@@ -265,56 +259,26 @@ def execute_p2p_op_list(p2p_op_list, stage: str, weights_update_group, use_async
 
     logger.info(f"[{os.getpid()}] Start to execute {num_ops} p2p operations for {stage}, {num_sends} sends, {num_recvs} recvs")
     if p2p_op_list:
-        if use_async:
-            # Use individual async isend/irecv calls
-            msg = f"[{os.getpid()}] Using individual async isend/irecv for {num_ops} operations for stage {stage}"
-            logger.info(msg)
-            future = Future()
-            hang_detector.submit(detect_hang, future, msg, p2p_op_list)
+        # Use synchronous send/recv
+        msg = f"[{os.getpid()}] Using synchronous send/recv for {num_ops} operations for stage {stage}"
+        logger.info(msg)
+        future = Future()
+        hang_detector.submit(detect_hang, future, msg, p2p_op_list)
 
-            # Issue all async operations individually
-            reqs = []
-            for _, p2p_op in p2p_op_list:
-                if p2p_op.op == dist.isend:
-                    logger.debug(f"[{os.getpid()}] isend to rank {p2p_op.peer}, tensor shape {p2p_op.tensor.shape}")
-                    req = dist.isend(p2p_op.tensor, p2p_op.peer, group=p2p_op.group)
-                    reqs.append(req)
-                elif p2p_op.op == dist.irecv:
-                    logger.debug(f"[{os.getpid()}] irecv from rank {p2p_op.peer}, tensor shape {p2p_op.tensor.shape}")
-                    req = dist.irecv(p2p_op.tensor, p2p_op.peer, group=p2p_op.group)
-                    reqs.append(req)
-                else:
-                    raise ValueError(f"Unknown p2p op: {p2p_op.op}")
+        # Execute synchronous operations
+        for _, p2p_op in p2p_op_list:
+            if p2p_op.op == dist.isend:
+                logger.debug(f"[{os.getpid()}] send to rank {p2p_op.peer}, tensor shape {p2p_op.tensor.shape}")
+                dist.send(p2p_op.tensor, p2p_op.peer, group=p2p_op.group)
+            elif p2p_op.op == dist.irecv:
+                logger.debug(f"[{os.getpid()}] recv from rank {p2p_op.peer}, tensor shape {p2p_op.tensor.shape}")
+                dist.recv(p2p_op.tensor, p2p_op.peer, group=p2p_op.group)
+            else:
+                raise ValueError(f"Unknown p2p op: {p2p_op.op}")
 
-            # Wait for all operations to complete
-            logger.info(f"[{os.getpid()}] Waiting for {len(reqs)} requests to complete for stage {stage}")
-            for req in reqs:
-                req.wait()
-
-            torch.cuda.synchronize()
-            future.set_result(True)
-            logger.info(f"[{os.getpid()}] All async operations completed for {num_ops} operations for {stage}")
-        else:
-            # Use synchronous send/recv
-            msg = f"[{os.getpid()}] Using synchronous send/recv for {num_ops} operations for stage {stage}"
-            logger.info(msg)
-            future = Future()
-            hang_detector.submit(detect_hang, future, msg, p2p_op_list)
-
-            # Execute synchronous operations
-            for _, p2p_op in p2p_op_list:
-                if p2p_op.op == dist.isend:
-                    logger.debug(f"[{os.getpid()}] send to rank {p2p_op.peer}, tensor shape {p2p_op.tensor.shape}")
-                    dist.send(p2p_op.tensor, p2p_op.peer, group=p2p_op.group)
-                elif p2p_op.op == dist.irecv:
-                    logger.debug(f"[{os.getpid()}] recv from rank {p2p_op.peer}, tensor shape {p2p_op.tensor.shape}")
-                    dist.recv(p2p_op.tensor, p2p_op.peer, group=p2p_op.group)
-                else:
-                    raise ValueError(f"Unknown p2p op: {p2p_op.op}")
-
-            torch.cuda.synchronize()
-            future.set_result(True)
-            logger.info(f"[{os.getpid()}] All sync operations completed for {num_ops} operations for {stage}")
+        torch.cuda.synchronize()
+        future.set_result(True)
+        logger.info(f"[{os.getpid()}] All sync operations completed for {num_ops} operations for {stage}")
     else:
         logger.info(f"[{os.getpid()}] No p2p operations for {stage}")
     duration = time.time() - start_time

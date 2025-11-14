@@ -20,6 +20,7 @@ import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -171,10 +172,8 @@ class NcclColocateStreamBatchTransport:
         - Round 1: partition_size=world_size, split into [0, world_size/2) and [world_size/2, world_size)
           - First half sends to second half
           - Second half recvs from first half
-          - Barrier
           - First half recvs from second half
           - Second half sends to first half
-          - Barrier
 
         - Round 2: partition_size=world_size/2, operate on each half independently
         - ...
@@ -224,14 +223,9 @@ class NcclColocateStreamBatchTransport:
                         num_ops += self._execute_ops(all_recv_p2p_ops[peer_rank])
             logger.info(f"[{os.getpid()}] [{rank_coordinate}] Round {round_idx} Phase 1: enqueued {num_ops} "
                        f"{'sends' if in_first_half else 'recvs'}")
-            # MUST synchronize before barrier to ensure CUDA operations complete
             torch.cuda.synchronize()
             logger.info(f"[{os.getpid()}] [{rank_coordinate}] Round {round_idx} Phase 1: executed {num_ops} "
                        f"{'sends' if in_first_half else 'recvs'}")
-            # Barrier to ensure all ranks complete Phase 1 before starting Phase 2
-            # dist.barrier(group=weights_update_group, device_ids=[torch.cuda.current_device()])
-            logger.info(f"[{os.getpid()}] [{rank_coordinate}]  Round {round_idx} Phase 1: barrier passed")
-
             num_ops2 = 0
             # === PHASE 2: First half receives from second half, second half sends to first half ===
             if in_first_half:
@@ -246,13 +240,9 @@ class NcclColocateStreamBatchTransport:
                         num_ops2 += self._execute_ops(all_send_p2p_ops[peer_rank])
             logger.info(f"[{os.getpid()}] [{rank_coordinate}] Round {round_idx} Phase 2: enqueued {num_ops2} "
                        f"{'recvs' if in_first_half else 'sends'}")
-            # MUST synchronize before barrier to ensure CUDA operations complete
             torch.cuda.synchronize()
             logger.info(f"[{os.getpid()}] [{rank_coordinate}] Round {round_idx} Phase 2: executed {num_ops2} "
                        f"{'recvs' if in_first_half else 'sends'}")
-            # Barrier to ensure all ranks complete Phase 2 before next round
-            # dist.barrier(group=weights_update_group, device_ids=[torch.cuda.current_device()])
-            logger.info(f"[{os.getpid()}] [{rank_coordinate}] Round {round_idx} Phase 2: barrier passed")
             round_duration = time.time() - round_start
             logger.info(f"[{os.getpid()}] Round {round_idx} completed: "
                        f"phase1={num_ops} ops, phase2={num_ops2} ops, "
@@ -266,9 +256,7 @@ class NcclColocateStreamBatchTransport:
         num_ops = 0
         if not ops:
             return num_ops
-        op = ops[0][1]
-        target_rank = op.peer
-        with self._get_stream(target_rank):
+        with self._get_stream():
             for plan_op, p2p_op in ops:
                 if p2p_op.op is dist.isend:
                     dist.send(p2p_op.tensor, p2p_op.peer, group=p2p_op.group)
@@ -277,13 +265,16 @@ class NcclColocateStreamBatchTransport:
                 num_ops += 1
         return num_ops
 
-    def _get_stream(self, target_rank: int):
-        while len(self._streams) <= target_rank:
-            self._streams.append(None)
-        stream = self._streams[target_rank]
-        if stream is None:
-            self._streams[target_rank] = stream = torch.cuda.Stream(target_rank)
-        return torch.cuda.stream(stream)
+    @contextmanager
+    def _get_stream(self):
+        if not self._streams:
+            self._streams.append(torch.cuda.Stream())
+        stream = self._streams.pop()
+        try:
+            with torch.cuda.stream(stream):
+                yield  # Now the body of "with _get_stream()" executes under stream context
+        finally:
+            self._streams.append(stream)
 
 
 def execute_recursive_partition_transfer(
