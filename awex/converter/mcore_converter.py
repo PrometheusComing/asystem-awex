@@ -6,7 +6,7 @@ from torch import distributed as dist
 from transformers import PretrainedConfig
 
 from awex.sharding.rank_info import RankInfo
-from awex.util import divide
+from awex.util.common import divide
 
 
 def _process_mcore_pp_name(
