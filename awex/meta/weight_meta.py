@@ -7,7 +7,7 @@ import torch
 from awex.sharding.param_sharding import (
     ShardingType,
 )
-from awex.util import to_dict
+from awex.util.common import to_dict
 
 logger = logging.getLogger(__name__)
 

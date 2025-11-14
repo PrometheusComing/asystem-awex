@@ -8,7 +8,8 @@ from awex.meta.weight_meta import compute_total_model_size, dump_parameters_meta
 from awex.sharding.param_sharding import ShardingType
 from awex.sharding.rank_info import RankInfo
 from awex.sharding import get_rank_info_extractor, get_sharding_strategy_builder
-from awex.util import to_dict
+from awex.util.common import to_dict
+from awex.models.registry import get_infer_weights_converter
 
 
 class InferParamMetaResolver(ParamMetaResolver):
@@ -130,10 +131,7 @@ class InferParamMetaResolver(ParamMetaResolver):
             "params_meta": params_meta,
             "model_arch_name": model_arch_name,
         }
-        from awex.converter.weights_converter import (
-            get_weights_converter,
-        )
-        converter_builder = get_weights_converter(engine_name)
+        converter_builder = get_infer_weights_converter(engine_name)
         sglang_to_hf_weight_converter = converter_builder(
             model_config=model.config,
             server_args=server_args,
