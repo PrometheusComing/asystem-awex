@@ -5,7 +5,7 @@ from awex.meta.meta_server import (
     MetaServerClient,
     start_meta_server,
 )
-from awex.util import to_binary, from_binary
+from awex.util.common import to_binary, from_binary
 
 
 # Define test class at module level so it can be pickled
