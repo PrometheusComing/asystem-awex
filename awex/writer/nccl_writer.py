@@ -1,0 +1,307 @@
+import gc
+import logging
+import os
+import time
+
+import torch
+
+from awex.transfer.transfer_plan import TransferPlanBuilder, slice_tensor
+from awex.util.common import get_ip_address, compute_statistics
+from awex.util.gpu import print_current_gpu_status
+from awex.util.process_group import init_weights_update_group, setup_batch_isend_irecv
+from awex.util.system_util import count_open_fds
+from awex.util.tensor_util import (
+    group_tensors_by_shape_and_dtype,
+    ipc_serialize,
+    cuda_ipc_serialize,
+    release_tensors,
+)
+from awex.writer.weights_writer import WeightsExchangeShardingWriter
+import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
+
+
+class NCCLWeightsWriter(WeightsExchangeShardingWriter):
+    def _initialize(self):
+        super()._initialize()
+        logger.info(
+            f"Start to initialize NCCL weights writer for rank {self.transfer_rank}"
+        )
+        if self.enable_colocate_mode:
+            self._init_writer_in_colocate_mode()
+            return
+        logger.info(f"Start to build transfer plan for rank {self.transfer_rank}")
+        self.transfer_plan = TransferPlanBuilder(
+            self.infer_world_size,
+            self.training_world_size,
+            self.num_infer_engines,
+            self.enable_debug_mode,
+        ).build_local_transfer_plan(
+            self.infer_params_meta,
+            self.parameters_meta,
+            self.transfer_rank,
+        )
+        self.recv_ranks = list(self.transfer_plan.operations.keys())
+        self.recv_ranks_sample = (
+            self.recv_ranks[:8] + ["..."] + self.recv_ranks[-8:]
+            if len(self.recv_ranks) > 16
+            else self.recv_ranks
+        )
+        self.num_to_sends = sum(
+            len(operations) for operations in self.transfer_plan.operations.values()
+        )
+        logger.info(f"Finished building transfer plan for rank {self.transfer_rank}")
+        logger.info(
+            f"Start to get master info from meta server for rank {self.transfer_rank}"
+        )
+        master_info = self.meta_server_client.get_object(
+            "master_info", timeout=self.timeout
+        )
+        master_address, master_port = master_info
+        logger.info(
+            f"Get master info from meta server for rank {self.transfer_rank}: {master_info}"
+        )
+        self._set_device()
+        self.weights_update_group = init_weights_update_group(
+            master_address,
+            master_port,
+            self.transfer_rank,
+            self.transfer_world_size,
+            "weights_exchange",
+            role="train",
+        )
+        logger.info(f"Initialized NCCL weights writer for rank {self.transfer_rank}")
+        # Add a barrier to ensure all processes are ready
+        dist.barrier(
+            group=self.weights_update_group, device_ids=[torch.cuda.current_device()]
+        )
+        logger.info(f"Barrier passed for weights writer with rank {self.transfer_rank}")
+        if self.transfer_rank == self.transfer_world_size - 1:
+            logger.info(
+                f"Start to test NCCL ready for rank {self.transfer_rank}, world size {self.transfer_world_size}"
+            )
+            dist.send(
+                torch.tensor(1).cuda(),
+                dst=0,
+                group=self.weights_update_group,
+            )
+            logger.info(
+                f"NCCL ready: send tensor to rank {self.transfer_world_size - 1} from rank {self.transfer_rank}"
+            )
+        setup_batch_isend_irecv(
+            self.weights_update_group, self.transfer_rank, self.transfer_world_size
+        )
+        logger.info(
+            f"Finished initializing NCCL weights writer for rank {self.transfer_rank}"
+        )
+
+    def _set_device(self):
+        device = torch.cuda.current_device()
+        gpu_id = int(os.environ.get("DEVICE", device)) % torch.cuda.device_count()
+        logger.info(
+            f"[NCCLWeightsWriter] Set device to {gpu_id} for rank {self.transfer_rank}, device env is {os.environ.get('DEVICE')}, "
+            f"previous device is {device}, device_count is {torch.cuda.device_count()}, "
+            f"CUDA_VISIBLE_DEVICES env is {os.environ.get('CUDA_VISIBLE_DEVICES')}"
+        )
+        torch.cuda.set_device(gpu_id)
+
+    def _init_writer_in_colocate_mode(self):
+        self.ipc_backend = self.asystem_train_config.get(
+            "weights_exchange_ipc_backend", "cuda"
+        )
+        # Don't get IPC tensors here since every step, the memory address for weights will change
+        # because we use offloading for moving GPU tensors to CPU and back later
+        ip_address = get_ip_address()
+        self._set_device()
+        device_id = torch.cuda.current_device()
+        self.meta_server_client.add_object_to_set(
+            "training_device_rank_entries", (ip_address, device_id, self.transfer_rank)
+        )
+        logger.info(
+            f"Initialized NCCL weights writer for rank {self.transfer_rank} in colocate mode"
+        )
+
+    @torch.no_grad()
+    def _write_weights(self, step_id, **kwargs):
+        """
+        Asynchronously send weights to inference ranks using torch.distributed.isend.
+
+        This method implements a pipelined approach where:
+        1. For each sender rank, we maintain a queue of operations to send
+        2. We start isend operations in parallel to all sender ranks
+        3. When a send completes, we immediately start the next send to that rank
+        4. We continue until all operations to all sender ranks are completed
+
+        Args:
+            step_id: The training step ID used as communication tag
+            **kwargs: Additional keyword arguments (unused)
+        """
+        rank_coordinate = self.transfer_rank
+        logger.info(
+            f"Start to send weights using NCCL to {len(self.transfer_plan.operations)} ranks({self.recv_ranks_sample}) "
+            f"from rank {rank_coordinate} with {self.num_to_sends} sends"
+        )
+        start_time = time.time()
+        parameters = self.convert_parameters()
+        p2p_op_list, _ = nccl_build_send_ops(
+            parameters, self.transfer_plan, self.weights_update_group, -1
+        )
+        reqs = dist.batch_isend_irecv(p2p_op_list)
+        for req in reqs:
+            req.wait()
+        torch.cuda.synchronize(device=torch.cuda.current_device())
+        duration = time.time() - start_time
+        logger.info(
+            f"Finished sending weights for step {step_id} using NCCL to {len(self.transfer_plan.operations)} ranks({self.recv_ranks_sample}) "
+            f"from rank {rank_coordinate} with {self.num_to_sends} sends, took {duration:.4f} seconds"
+        )
+        compute_statistics(
+            self._history_write_weights_time,
+            step_id,
+            duration,
+            "Send weights using NCCL",
+        )
+        dist.barrier(
+            group=self.weights_update_group, device_ids=[torch.cuda.current_device()]
+        )
+        logger.info(
+            f"Barrier passed for writer step {step_id} with rank {self.transfer_rank}"
+        )
+
+    @torch.no_grad()
+    def _prepare_params_for_colocate(self):
+        logger.info(
+            f"Start to write weights in colocate mode for rank {self.transfer_rank}"
+        )
+        self.train_backend.release_grad_memory()
+        converted = self.convert_parameters()
+        tensors, names = [], []
+        for name, tensor in converted.items():
+            assert not tensor.requires_grad
+            tensors.append(tensor)
+            names.append(name)
+        return tensors, names
+
+    @torch.no_grad()
+    def _write_weights_in_colocate_mode(self, step_id, **kwargs):
+        start_time = time.time()
+        tensors, names = self._prepare_params_for_colocate()
+        num_tensors = len(tensors)
+        if self.ipc_backend == "cpu":
+            tensors = [t.cpu() for t in tensors]
+        logger.info(
+            f"Start to group tensors by shape and dtype for rank {self.transfer_rank}"
+        )
+        # this will copy tensor by concatenate
+        group_tensors, metadata = group_tensors_by_shape_and_dtype(tensors)
+        torch.cuda.synchronize(device=torch.cuda.current_device())
+        logger.info(
+            f"Finished grouping tensors by shape and dtype for rank {self.transfer_rank}"
+        )
+        print_current_gpu_status(
+            f"after group_tensors_by_shape_and_dtype for rank {self.transfer_rank}"
+        )
+        logger.info(f"Open fds before serialize: {count_open_fds()}")
+
+        release_tensors(tensors)
+        del tensors
+        self.train_backend.release_memory_occupation("weights")
+        self.meta_server_client.add_object_to_set(
+            "all_training_offloaded_weights", self.transfer_rank
+        )
+        print_current_gpu_status(
+            f"after offloaded weights for rank {self.transfer_rank}"
+        )
+
+        if self.ipc_backend == "cpu":
+            group_shared = [tensor.cpu().share_memory_() for tensor in group_tensors]
+            serialized_weights = ipc_serialize((group_shared, metadata, names))
+        else:
+            group_shared = [tensor.cuda().share_memory_() for tensor in group_tensors]
+            serialized_weights = cuda_ipc_serialize((group_shared, metadata, names))
+        torch.cuda.synchronize(device=torch.cuda.current_device())
+        logger.info(
+            f"Finished serializing ipc weights with {num_tensors} params, and {len(group_shared)} groups "
+            f"for rank {self.transfer_rank}"
+        )
+        logger.info(f"Open fds after serialize: {count_open_fds()}")
+
+        # Put serialized weights to meta server
+        ip_address = get_ip_address()
+        device_id = torch.cuda.current_device()
+        key_suffix = f"_{ip_address}_{device_id}_{step_id}"
+        serialized_weights_key = f"training_serialized_weights{key_suffix}"
+        self.meta_server_client.put_object(
+            serialized_weights_key,
+            (self.transfer_rank, self.rank_info, serialized_weights),
+        )
+        logger.info(
+            f"Put {len(group_shared)} serialized training weights to meta server "
+            f"with key {serialized_weights_key} for step {step_id}"
+        )
+        # Wait for inference engines to finish processing
+        update_finished_key = f"weights_update_finished{key_suffix}"
+        self.meta_server_client.get_object(update_finished_key, timeout=self.timeout)
+        self.meta_server_client.delete_if_exists(update_finished_key)
+        release_tensors(group_tensors)
+        release_tensors(group_shared)
+        del group_tensors
+        del group_shared
+        torch.cuda.synchronize(device=torch.cuda.current_device())
+        gc.collect()
+        torch.cuda.empty_cache()
+        print_current_gpu_status(
+            f"after clear group_shared for rank {self.transfer_rank}"
+        )
+        write_finished_key = f"write_finished{key_suffix}"
+        self.meta_server_client.put_object(write_finished_key, True)
+        duration = time.time() - start_time
+        compute_statistics(
+            self._history_write_weights_time,
+            step_id,
+            duration,
+            "Send weights using NCCL in colocate mode",
+        )
+        logger.info(
+            f"Finished writing weights in colocate mode for rank {self.transfer_rank}"
+        )
+
+
+@torch.no_grad()
+def nccl_build_send_ops(parameters, transfer_plan, weights_update_group, copy_rank):
+    send_progress = {rank: 0 for rank in transfer_plan.operations.keys()}
+    unfinished_ranks = set(transfer_plan.operations.keys())
+    p2p_op_list = []
+    copy_op_list = []
+    train_slice_context = {}
+    while len(unfinished_ranks) > 0:
+        finished_ranks = set()
+        for recv_rank in unfinished_ranks:
+            operations = transfer_plan.operations[recv_rank]
+            progress = send_progress[recv_rank]
+            num_operations = len(operations)
+            if progress < num_operations:
+                op = operations[progress]
+                send_tensor = parameters[op.send_shard_meta.name]
+                tensor_sliced = slice_tensor(
+                    send_tensor, op, True, slice_context=train_slice_context
+                )
+                if recv_rank == copy_rank:
+                    copy_op_list.append(tensor_sliced)
+                else:
+                    p2p_op_list.append(
+                        dist.P2POp(
+                            dist.isend,
+                            tensor_sliced,
+                            recv_rank,
+                            group=weights_update_group,
+                        )
+                    )
+                send_progress[recv_rank] = progress + 1
+            else:
+                finished_ranks.add(recv_rank)
+        for rank in finished_ranks:
+            unfinished_ranks.remove(rank)
+    return p2p_op_list, copy_op_list
+
