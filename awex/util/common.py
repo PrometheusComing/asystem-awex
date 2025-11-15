@@ -1,6 +1,7 @@
 import math
 import struct
 import subprocess
+from dataclasses import asdict
 from typing import List
 import torch.distributed as dist
 import os
@@ -201,3 +202,28 @@ def stripped_env_vars():
             vars[k] = v
     vars.pop("LS_COLORS", None)
     return vars
+
+
+
+class AttrDict(dict):
+    """Dictionary that allows attribute-style access."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Ensure that attributes refer to dictionary keys
+        self.__dict__ = self
+
+
+def simple_server_args(server_args):
+    config = asdict(server_args)
+    return AttrDict(**config)
+
+
+def simple_hg_config(hg_config):
+    config = hg_config.to_dict()
+    final_config = {}
+    for k, v in config.items():
+        if "sglang" in str(v):
+            logger.warning(f"Skipping sglang config {k}: {v}")
+            continue
+        final_config[k] = v
+    return AttrDict(**config)
