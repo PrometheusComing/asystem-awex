@@ -65,7 +65,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         logger.info(f"Meta server address: {self.meta_server_addr}")
         self.meta_server_client = MetaServerClient(*self.meta_server_addr.split(":"))
         self.infer_conf = None
-        self.infer_server_args = None
+        self.infer_engine_config = None
         self.model = self.train_backend.model_engine
         self.hf_config = self.train_backend.hf_config
         self.model_arch_name = self.hf_config.architectures[0]
@@ -112,7 +112,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             "infer_conf", timeout=self.timeout
         )
         logger.info(f"Got inference config from meta server: {self.infer_conf}")
-        self.infer_server_args = self.infer_conf["server_args"]
+        self.infer_engine_config = self.infer_conf["infer_engine_config"]
         self.infer_world_size = self.infer_conf["infer_world_size"]
         self.rank_info = get_rank_info_extractor(self.engine_name)()
         logger.info(f"Writer rank info: {self.rank_info}")

@@ -109,11 +109,11 @@ def get_infer_weights_converter(
     model_name: str,
     hf_config: PretrainedConfig,
     rank_info,
-    server_args: Dict
+    infer_engine_config: Dict
 ):
     config = ModelRegistry.get_model_config(model_name)
     if engine_name == "sglang":
         converter = config.sglang_converter or SGlangToHFWeightConverter
-        return converter(hf_config, server_args, rank_info)
+        return converter(hf_config, infer_engine_config, rank_info)
     else:
         raise NotImplementedError(f'Engine {engine_name} not implemented.')

@@ -19,7 +19,7 @@ from awex.sharding.param_sharding import (
 )
 from awex.util.common import (
     compute_statistics,
-    check_train_infer_params_meta, simple_server_args, simple_hg_config,
+    check_train_infer_params_meta, simple_hg_config,
 )
 from awex.util.common import stripped_env_vars
 from awex.util.tensor_util import (
@@ -64,8 +64,7 @@ class WeightsExchangeShardingReader(WeightExchangeReader):
 
     def __init__(self, meta_resolver: InferParamMetaResolver, inference_backend):
         super().__init__(inference_backend)
-        self.sgl_engine = inference_backend.engine
-        self.sgl_args = self.sgl_engine.server_args
+        self.infer_engine_config = self.inference_backend.infer_engine_config
         self.meta_resolver = meta_resolver
         self.parameters_meta = []
         self.hf_config = inference_backend.hf_config
@@ -123,7 +122,7 @@ class WeightsExchangeShardingReader(WeightExchangeReader):
         self.infer_conf = {
             "infer_atten_tp_size": self.meta_resolver.rank0_info.attn_tp_size,
             "router_dtype": getattr(self.hf_config, "router_dtype", "bf16"),
-            "server_args": simple_server_args(self.sgl_args),
+            "infer_engine_config": self.infer_engine_config,
             "hf_config": simple_hg_config(self.hf_config),
             "infer_world_size": self.infer_world_size,
         }
@@ -540,7 +539,7 @@ class WorkerWeightsReader:
         self.hf_config = infer_conf["hf_config"]
         self.model_arch_name = self.hf_config.architectures[0]
         self.scheduler = model_context["scheduler"]
-        self.server_args = model_context["server_args"]
+        self.infer_engine_config = model_context["infer_engine_config"]
         self.engine_rank = engine_rank
         self.num_engines = num_engines
         self.enable_debug_mode = enable_debug_mode
@@ -573,7 +572,7 @@ class WorkerWeightsReader:
         self.meta_server_client = MetaServerClient(*self.meta_server_addr.split(":"))
         self.weight_converter = get_infer_weights_converter(self.engine_name)(
             self.model.config,
-            server_args=self.server_args,
+            infer_engine_config=self.infer_engine_config,
             rank_info=self.rank_info,
         )
         self.curent_worker_parameters_meta = [
