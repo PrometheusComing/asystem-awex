@@ -15,7 +15,7 @@ import multiprocessing
 import signal
 import random
 
-from awex.util import (
+from awex.util.common import (
     configure_logging,
     to_binary,
     from_binary,

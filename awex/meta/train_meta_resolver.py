@@ -10,7 +10,8 @@ from awex.meta.meta_resolver import ParamMetaResolver, logger
 from awex.meta.weight_meta import dump_parameters_meta, compute_total_model_size, ParameterMeta
 from awex.sharding.param_sharding import ShardingType
 from awex.sharding.rank_info import RankInfo
-from awex.util import to_dict
+from awex.util.common import to_dict
+from awex.models.registry import get_train_weights_converter
 
 
 class McoreParamMetaResolver(ParamMetaResolver):
@@ -90,12 +91,9 @@ class McoreParamMetaResolver(ParamMetaResolver):
             "params_meta": params_meta,
             "model_arch_name": self._model_arch_name,
         }
-        from awex.converter.weights_converter import (
-            get_weights_converter,
-        )
         from awex.converter.mcore_converter import get_mcore_model_parameters
 
-        mcore_to_hf_weight_converter = get_weights_converter(self._train_backend.engine_name)(
+        mcore_to_hf_weight_converter = get_train_weights_converter(self._train_backend.engine_name)(
             self._model_arch_name, self.hf_config, self._rank_info, self._infer_conf
         )
         for model in self._mcore_model:
