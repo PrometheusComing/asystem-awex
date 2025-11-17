@@ -7,7 +7,7 @@ def get_mcore_sharding_strategy(model_name: str, rank_info: RankInfo, **kwargs):
     from awex.models import get_sharding_strategy
     cls = get_sharding_strategy(model_name)
     return cls(
-        engine_type="mcore",
+        engine_name="mcore",
         enable_dp_attention=False,
         enable_dp_lm_head=False,
         moe_dense_tp_size=rank_info.tp_size,

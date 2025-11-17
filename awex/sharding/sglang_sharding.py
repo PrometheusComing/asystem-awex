@@ -10,7 +10,7 @@ def get_sglang_sharding_strategy(
     from awex.models import get_sharding_strategy
     cls = get_sharding_strategy(model_name)
     return cls(
-        engine_type="sglang",
+        engine_name="sglang",
         enable_dp_attention=server_args.enable_dp_attention,
         enable_dp_lm_head=server_args.enable_dp_lm_head,
         moe_dense_tp_size=server_args.moe_dense_tp_size,
@@ -20,7 +20,6 @@ def get_sglang_sharding_strategy(
         rank_info=rank_info,
         **kwargs,
     )
-
 
 
 def get_sglang_rank_info(model_context, engine_rank) -> RankInfo:
