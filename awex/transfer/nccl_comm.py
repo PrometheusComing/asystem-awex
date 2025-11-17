@@ -12,151 +12,156 @@ from awex.transfer.transfer_plan import slice_tensor
 
 logger = logging.getLogger(__name__)
 
+class NcclColocateTransport:
+    def __init__(self, transfer_rank, world_size):
+        self.transfer_rank = transfer_rank
+        self.world_size = world_size
 
-def update_weights_in_colocate_mode(
-    train_to_infer_device_mapping,
-    infer_to_train_device_mapping,
-    transfer_rank,
-    rank_coordinate,
-    world_size,
-    send_transfer_plan,
-    recv_transfer_plan,
-    weights_update_group,
-    send_parameters,
-    recv_parameters,
-    *,
-    group_size=None,
-    enable_debug_mode=False,
-    use_async_p2p=False
-):
-    logger.info(f"train_to_infer_device_mapping {train_to_infer_device_mapping}")
-    logger.info(f"infer_to_train_device_mapping {infer_to_train_device_mapping}")
-    logger.info(f"P2P mode: {'async (individual isend/irecv)' if use_async_p2p else 'sync (send/recv)'}")
-    validate_rank_mappings(train_to_infer_device_mapping, infer_to_train_device_mapping)
-    start_time = time.time()
-    group_size = world_size
-    send_ops = dict(send_transfer_plan.operations)
-    recv_ops = dict(recv_transfer_plan.operations)
-    num_sends = sum(len(ops) for ops in send_ops.values())
-    num_recvs = sum(len(ops) for ops in recv_ops.values())
-    logger.info(f"Start to execute weights update for {rank_coordinate},"
-                f"num_sends {num_sends}, num_recvs {num_recvs}")
-    p2p_send_op_groups, p2p_recv_op_groups = [], []
-    tensors_to_copy = []
-    stage, last_stage = 0, -1
-    stage_offsets = []
-    train_slice_context = {}
-    while stage < world_size:
-        p2p_send_ops, p2p_recv_ops = [], []
-        stage_offset = stage % world_size
-        send_to_rank = transfer_rank + stage
-        if send_to_rank >= world_size:
-            send_to_rank -= world_size
-        recv_from_rank = transfer_rank - stage
-        if recv_from_rank < 0:
-            recv_from_rank += world_size
-        had_send_entries = send_to_rank in send_ops
-        if had_send_entries:
-            for op in send_ops[send_to_rank]:
-                send_tensor = send_parameters[op.send_shard_meta.name]
-                tensor_sliced = slice_tensor(send_tensor, op, True, slice_context=train_slice_context)
-                if send_to_rank == transfer_rank:
-                    tensors_to_copy.append(tensor_sliced)
-                    continue
-                assert send_to_rank == op.recv_rank, f"rank unmatched: {send_to_rank} {op.recv_rank}"
-                p2p_op = dist.P2POp(
-                    dist.isend,
-                    tensor_sliced.clone(),
-                    op.recv_rank,
-                    group=weights_update_group,
-                )
-                p2p_send_ops.append((op, p2p_op))
-        send_rank = infer_to_train_device_mapping[recv_from_rank]
-        op_send_rank = train_to_infer_device_mapping[send_rank]
-        had_recv_entries = send_rank in recv_ops
-        if had_recv_entries:
-            for op in recv_ops[send_rank]:
-                if recv_from_rank == transfer_rank:
-                    continue
-                recv_tensor = recv_parameters[op.recv_shard_meta.name]
-                tensor_sliced = slice_tensor(recv_tensor, op, False)
-                assert send_rank == op.send_rank, f"rank unmatched: {send_rank} {op.send_rank}"
-                p2p_op = dist.P2POp(
-                        dist.irecv,
-                        tensor_sliced,
-                        op_send_rank,
+    def update_weights_in_colocate_mode(
+        self,
+        train_to_infer_device_mapping,
+        infer_to_train_device_mapping,
+        transfer_rank,
+        rank_coordinate,
+        world_size,
+        send_transfer_plan,
+        recv_transfer_plan,
+        weights_update_group,
+        send_parameters,
+        recv_parameters,
+        *,
+        group_size=None,
+        enable_debug_mode=False,
+        use_async_p2p=False
+    ):
+        logger.info(f"train_to_infer_device_mapping {train_to_infer_device_mapping}")
+        logger.info(f"infer_to_train_device_mapping {infer_to_train_device_mapping}")
+        logger.info(f"P2P mode: {'async (individual isend/irecv)' if use_async_p2p else 'sync (send/recv)'}")
+        validate_rank_mappings(train_to_infer_device_mapping, infer_to_train_device_mapping)
+        start_time = time.time()
+        group_size = world_size
+        send_ops = dict(send_transfer_plan.operations)
+        recv_ops = dict(recv_transfer_plan.operations)
+        num_sends = sum(len(ops) for ops in send_ops.values())
+        num_recvs = sum(len(ops) for ops in recv_ops.values())
+        logger.info(f"Start to execute weights update for {rank_coordinate},"
+                    f"num_sends {num_sends}, num_recvs {num_recvs}")
+        p2p_send_op_groups, p2p_recv_op_groups = [], []
+        tensors_to_copy = []
+        stage, last_stage = 0, -1
+        stage_offsets = []
+        train_slice_context = {}
+        while stage < world_size:
+            p2p_send_ops, p2p_recv_ops = [], []
+            stage_offset = stage % world_size
+            send_to_rank = transfer_rank + stage
+            if send_to_rank >= world_size:
+                send_to_rank -= world_size
+            recv_from_rank = transfer_rank - stage
+            if recv_from_rank < 0:
+                recv_from_rank += world_size
+            had_send_entries = send_to_rank in send_ops
+            if had_send_entries:
+                for op in send_ops[send_to_rank]:
+                    send_tensor = send_parameters[op.send_shard_meta.name]
+                    tensor_sliced = slice_tensor(send_tensor, op, True, slice_context=train_slice_context)
+                    if send_to_rank == transfer_rank:
+                        tensors_to_copy.append(tensor_sliced)
+                        continue
+                    assert send_to_rank == op.recv_rank, f"rank unmatched: {send_to_rank} {op.recv_rank}"
+                    p2p_op = dist.P2POp(
+                        dist.isend,
+                        tensor_sliced.clone(),
+                        op.recv_rank,
                         group=weights_update_group,
                     )
-                p2p_recv_ops.append((op, p2p_op))
-        if had_send_entries and send_to_rank != transfer_rank and not p2p_send_ops:
-            raise RuntimeError(
-                f"Inconsistent send plan for rank {rank_coordinate}: "
-                f"stage_offset {stage_offset}, transfer_rank {transfer_rank} "
-                f"expected sends to rank {send_to_rank} but built zero P2P ops."
+                    p2p_send_ops.append((op, p2p_op))
+            send_rank = infer_to_train_device_mapping[recv_from_rank]
+            op_send_rank = train_to_infer_device_mapping[send_rank]
+            had_recv_entries = send_rank in recv_ops
+            if had_recv_entries:
+                for op in recv_ops[send_rank]:
+                    if recv_from_rank == transfer_rank:
+                        continue
+                    recv_tensor = recv_parameters[op.recv_shard_meta.name]
+                    tensor_sliced = slice_tensor(recv_tensor, op, False)
+                    assert send_rank == op.send_rank, f"rank unmatched: {send_rank} {op.send_rank}"
+                    p2p_op = dist.P2POp(
+                            dist.irecv,
+                            tensor_sliced,
+                            op_send_rank,
+                            group=weights_update_group,
+                        )
+                    p2p_recv_ops.append((op, p2p_op))
+            if had_send_entries and send_to_rank != transfer_rank and not p2p_send_ops:
+                raise RuntimeError(
+                    f"Inconsistent send plan for rank {rank_coordinate}: "
+                    f"stage_offset {stage_offset}, transfer_rank {transfer_rank} "
+                    f"expected sends to rank {send_to_rank} but built zero P2P ops."
+                )
+            if had_recv_entries and recv_from_rank != transfer_rank and not p2p_recv_ops:
+                raise RuntimeError(
+                    f"Inconsistent recv plan for rank {rank_coordinate}: "
+                    f"stage_offset {stage_offset}, transfer_rank {transfer_rank} "
+                    f"expected recvs from rank {op_send_rank} but built zero P2P ops."
+                )
+            p2p_send_op_groups.append(p2p_send_ops)
+            p2p_recv_op_groups.append(p2p_recv_ops)
+            stage_offsets.append(stage_offset)
+            stage += 1
+        if len(tensors_to_copy) > 0:
+            send_rank = infer_to_train_device_mapping[transfer_rank]
+            execute_tensors_to_copy(
+                tensors_to_copy,
+                recv_transfer_plan.operations[send_rank],
+                recv_parameters,
+                f"tensor copy for {rank_coordinate}"
             )
-        if had_recv_entries and recv_from_rank != transfer_rank and not p2p_recv_ops:
-            raise RuntimeError(
-                f"Inconsistent recv plan for rank {rank_coordinate}: "
-                f"stage_offset {stage_offset}, transfer_rank {transfer_rank} "
-                f"expected recvs from rank {op_send_rank} but built zero P2P ops."
-            )
-        p2p_send_op_groups.append(p2p_send_ops)
-        p2p_recv_op_groups.append(p2p_recv_ops)
-        stage_offsets.append(stage_offset)
-        stage += 1
-    if len(tensors_to_copy) > 0:
-        send_rank = infer_to_train_device_mapping[transfer_rank]
-        execute_tensors_to_copy(
-            tensors_to_copy,
-            recv_transfer_plan.operations[send_rank],
-            recv_parameters,
-            f"tensor copy for {rank_coordinate}"
-        )
-    else:
-        logger.info(f"No tensors to copy for {rank_coordinate}")
-
-    # Execute p2p operations in two phases per stage so each batch_isend_irecv only
-    # contains sends OR receives (not both), and peer ranks do complementary ops.
-    for stage_idx, stage_offset in enumerate(stage_offsets):
-        send_ops = p2p_send_op_groups[stage_idx]
-        recv_ops = p2p_recv_op_groups[stage_idx]
-        stage_name = f"{rank_coordinate} stage {stage_offset}"
-
-        if stage_offset == 0:
-            assert not send_ops
-            assert not recv_ops
         else:
-            # Compute partition so every sender and its peer receiver pick opposite phases
-            partition = compute_two_phase_partition(transfer_rank, stage_offset, world_size)
-            # Phase 1: Partition 0 sends, partition 1 receives
-            if partition == 0:
-                if send_ops:
-                    execute_p2p_op_list(send_ops, f"p2p send for {stage_name}", weights_update_group, use_async_p2p)
+            logger.info(f"No tensors to copy for {rank_coordinate}")
+
+        # Execute p2p operations in two phases per stage so each batch_isend_irecv only
+        # contains sends OR receives (not both), and peer ranks do complementary ops.
+        for stage_idx, stage_offset in enumerate(stage_offsets):
+            send_ops = p2p_send_op_groups[stage_idx]
+            recv_ops = p2p_recv_op_groups[stage_idx]
+            stage_name = f"{rank_coordinate} stage {stage_offset}"
+
+            if stage_offset == 0:
+                assert not send_ops
+                assert not recv_ops
             else:
-                if recv_ops:
-                    execute_p2p_op_list(recv_ops, f"p2p recv for {stage_name}", weights_update_group, use_async_p2p)
+                # Compute partition so every sender and its peer receiver pick opposite phases
+                partition = compute_two_phase_partition(transfer_rank, stage_offset, world_size)
+                # Phase 1: Partition 0 sends, partition 1 receives
+                if partition == 0:
+                    if send_ops:
+                        execute_p2p_op_list(send_ops, f"p2p send for {stage_name}", weights_update_group, use_async_p2p)
+                else:
+                    if recv_ops:
+                        execute_p2p_op_list(recv_ops, f"p2p recv for {stage_name}", weights_update_group, use_async_p2p)
 
-            # Global barrier after Phase 1 to ensure all ranks complete before Phase 2
-            # This is necessary because NCCL might have internal state that requires synchronization
-            dist.barrier(group=weights_update_group)
+                # Global barrier after Phase 1 to ensure all ranks complete before Phase 2
+                # This is necessary because NCCL might have internal state that requires synchronization
+                dist.barrier(group=weights_update_group)
 
-            # Phase 2: Partition 0 receives, partition 1 sends
-            if partition == 0:
-                if recv_ops:
-                    execute_p2p_op_list(recv_ops, f"p2p recv for {stage_name}", weights_update_group, use_async_p2p)
-            else:
-                if send_ops:
-                    execute_p2p_op_list(send_ops, f"p2p send for {stage_name}", weights_update_group, use_async_p2p)
+                # Phase 2: Partition 0 receives, partition 1 sends
+                if partition == 0:
+                    if recv_ops:
+                        execute_p2p_op_list(recv_ops, f"p2p recv for {stage_name}", weights_update_group, use_async_p2p)
+                else:
+                    if send_ops:
+                        execute_p2p_op_list(send_ops, f"p2p send for {stage_name}", weights_update_group, use_async_p2p)
 
-            # Global barrier after Phase 2 to ensure all ranks complete before next stage
-            dist.barrier(group=weights_update_group)
-        # No additional barrier here; Phase 2 per-pair barrier above prevents early advance
+                # Global barrier after Phase 2 to ensure all ranks complete before next stage
+                dist.barrier(group=weights_update_group)
+            # No additional barrier here; Phase 2 per-pair barrier above prevents early advance
 
-    # No final global barrier here
-    logger.info(f"[{os.getpid()}] All p2p stages completed for {rank_coordinate}")
+        # No final global barrier here
+        logger.info(f"[{os.getpid()}] All p2p stages completed for {rank_coordinate}")
 
-    duration = time.time() - start_time
-    logger.info(f"Finished executing weights update for {rank_coordinate}, took {duration:.4f} seconds")
+        duration = time.time() - start_time
+        logger.info(f"Finished executing weights update for {rank_coordinate}, took {duration:.4f} seconds")
 
 
 def execute_tensors_to_copy(tensors_to_copy, copy_ops, recv_parameters, stage: str):

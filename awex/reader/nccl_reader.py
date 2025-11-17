@@ -188,6 +188,8 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             self.training_params_meta,
             self.infer_to_train_device_mapping[self.transfer_rank],
         )
+        from awex.transfer.nccl_comm import NcclColocateTransport
+        self.colocate_transport = NcclColocateTransport(self.transfer_rank, self.infer_world_size)
         logger.info(
             f"Initialized NCCL weights reader for rank {self.transfer_rank} in colocate mode"
         )
@@ -312,10 +314,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"ranks({self.send_ranks_sample}) for rank {self.rank_coordinate}."
         )
         start_time = time.time()
-
-        from awex.transfer.nccl_comm import update_weights_in_colocate_mode
-
-        update_weights_in_colocate_mode(
+        self.colocate_transport.update_weights_in_colocate_mode(
             self.train_to_infer_device_mapping,
             self.infer_to_train_device_mapping,
             self.transfer_rank,
