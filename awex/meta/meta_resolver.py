@@ -11,7 +11,7 @@ from awex.sharding.rank_info import RankInfo
 
 logger = logging.getLogger(__name__)
 
-class ParameterMetaResolver(ABC):
+class ParamMetaResolver(ABC):
     """
     Resolves and reconstructs parameter metadata for a distributed model, including sharding and replica information.
     """
@@ -180,5 +180,3 @@ class ParameterMetaResolver(ABC):
         )
         logger.info(f"Number of shards: {num_shards}")
         return params_meta
-
-
