@@ -2,7 +2,7 @@ from awex.sharding.rank_info import RankInfo
 
 
 def get_sglang_sharding_strategy(
-    model_name: str, server_args, rank_info: RankInfo, **kwargs
+    model_name: str, infer_engine_config, rank_info: RankInfo, **kwargs
 ):
     """
     Get the sharding strategy class for a given model architecture name.
@@ -11,11 +11,11 @@ def get_sglang_sharding_strategy(
     cls = get_sharding_strategy(model_name)
     return cls(
         engine_name="sglang",
-        enable_dp_attention=server_args.enable_dp_attention,
-        enable_dp_lm_head=server_args.enable_dp_lm_head,
-        moe_dense_tp_size=server_args.moe_dense_tp_size,
+        enable_dp_attention=infer_engine_config.enable_dp_attention,
+        enable_dp_lm_head=infer_engine_config.enable_dp_lm_head,
+        moe_dense_tp_size=infer_engine_config.moe_dense_tp_size,
         tp_size=rank_info.tp_size,
-        ep_size=server_args.ep_size,
+        ep_size=infer_engine_config.ep_size,
         ep_tp_size=1,
         rank_info=rank_info,
         **kwargs,
@@ -24,18 +24,18 @@ def get_sglang_sharding_strategy(
 
 def get_sglang_rank_info(model_context, engine_rank) -> RankInfo:
     scheduler = model_context["scheduler"]
-    server_args = scheduler.server_args
-    if server_args.dp_size != 1 and not server_args.enable_dp_attention:
+    infer_engine_config = scheduler.infer_engine_config
+    if infer_engine_config.dp_size != 1 and not infer_engine_config.enable_dp_attention:
         raise ValueError(
-            f"DP size is not 1, but {server_args.dp_size}. This is not supported yet."
+            f"DP size is not 1, but {infer_engine_config.dp_size}. This is not supported yet."
         )
     tp_size = model_context["tp_size"]
     tp_rank = model_context["tp_rank"]
-    ep_size = server_args.ep_size
+    ep_size = infer_engine_config.ep_size
     if (
-        server_args.enable_ep_moe
-        or server_args.enable_deepep_moe
-        or (hasattr(server_args, "enable_pplx_moe") and server_args.enable_pplx_moe)
+        infer_engine_config.enable_ep_moe
+        or infer_engine_config.enable_deepep_moe
+        or (hasattr(infer_engine_config, "enable_pplx_moe") and infer_engine_config.enable_pplx_moe)
     ):
         assert ep_size == tp_size, "ep_size must be equal to tp_size"
         ep_rank = tp_rank

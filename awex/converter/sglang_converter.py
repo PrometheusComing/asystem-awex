@@ -10,18 +10,18 @@ class SGlangToHFWeightConverter:
     def __init__(
         self,
         model_config: PretrainedConfig,
-        server_args,
+        infer_engine_config,
         rank_info,
     ):
         self.model_config = model_config
         self.total_num_heads = model_config.num_attention_heads
         self.total_kv_heads = model_config.num_key_value_heads
-        self.server_args = server_args
+        self.infer_engine_config = infer_engine_config
         self.rank_info = rank_info
-        self.enable_ep_moe = server_args.enable_ep_moe
-        self.tp_size = server_args.tp_size
+        self.enable_ep_moe = infer_engine_config.enable_ep_moe
+        self.tp_size = infer_engine_config.tp_size
         self.tp_rank = self.rank_info.tp_rank
-        self.ep_size = self.server_args.ep_size
+        self.ep_size = infer_engine_config.ep_size
         self.ep_rank = self.rank_info.ep_rank
 
     def _fuse_qkv(self, name: str) -> bool:

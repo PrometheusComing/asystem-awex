@@ -23,12 +23,11 @@ class InferParamMetaResolver(ParamMetaResolver):
         """
         Args:
             inference_backend: The inference backend object that can execute tasks in model workers.
-            infer_conf (ServerArgs, optional): Inference configuration.
             convert_params: Whether to convert the parameters to the Hugging Face format.
         """
         super().__init__(inference_backend.hf_config)
         self._inference_backend = inference_backend
-        self._infer_conf = inference_backend.engine.server_args
+        self.infer_engine_config = inference_backend.engine.config
         self.engine_name = inference_backend.engine_name
         self.convert_params = convert_params
         self.num_engines = num_engines
@@ -40,6 +39,7 @@ class InferParamMetaResolver(ParamMetaResolver):
                 inference_backend.execute_task_in_model_worker(
                     self._get_model_param_info,
                     engine_name=self.engine_name,
+                    infer_engine_config=self.infer_engine_config,
                     engine_rank=engine_rank,
                     convert_params=False,
                 )
@@ -76,7 +76,7 @@ class InferParamMetaResolver(ParamMetaResolver):
         self._model_arch_name = self._rank0_meta["model_arch_name"]
         self._sharding_strategy = get_sharding_strategy_builder(self.engine_name)(
             self._model_arch_name,
-            self._infer_conf,
+            self.infer_engine_config,
             self.rank0_info,
         )
         self._params_meta = self._build_params_meta()
@@ -112,7 +112,7 @@ class InferParamMetaResolver(ParamMetaResolver):
         )
 
     @staticmethod
-    def _get_model_param_info(engine_name, convert_params=False, engine_rank=0, **kwargs):
+    def _get_model_param_info(engine_name, infer_engine_config, convert_params=False, engine_rank=0, **kwargs):
         """
         Static method to extract parameter meta information from a model and its context.
         Args:
@@ -122,7 +122,6 @@ class InferParamMetaResolver(ParamMetaResolver):
         """
         model = kwargs["model"]
         model_context = kwargs["model_context"]
-        server_args = model_context["server_args"]
         params_meta = []
         rank_info = get_rank_info_extractor(engine_name)(model_context, engine_rank)
         model_arch_name = type(model).__name__
@@ -134,7 +133,7 @@ class InferParamMetaResolver(ParamMetaResolver):
         converter_builder = get_infer_weights_converter(engine_name)
         sglang_to_hf_weight_converter = converter_builder(
             model_config=model.config,
-            server_args=server_args,
+            infer_engine_config=infer_engine_config,
             rank_info=rank_info,
         )
         params = []

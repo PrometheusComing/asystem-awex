@@ -213,11 +213,6 @@ class AttrDict(dict):
         self.__dict__ = self
 
 
-def simple_server_args(server_args):
-    config = asdict(server_args)
-    return AttrDict(**config)
-
-
 def simple_hg_config(hg_config):
     config = hg_config.to_dict()
     final_config = {}
