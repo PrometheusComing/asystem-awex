@@ -89,3 +89,44 @@ def to_dict(param_meta, ignore_keys=None) -> dict:
 def to_json(param_meta, ignore_keys=None) -> str:
     """Convert the parameter meta to a json string."""
     return json.dumps(to_dict(param_meta, ignore_keys), indent=2)
+
+
+def init_weights_update_group(
+    master_address,
+    master_port,
+    rank,
+    world_size,
+    group_name,
+    backend="nccl",
+    role="",
+):
+    """Initialize the Torch process group for model parameter updates."""
+    assert torch.distributed.is_initialized(), (
+        "Default torch process group must be initialized"
+    )
+    assert group_name != "", "Group name cannot be empty"
+
+    logger.info(
+        f"init custom process group for {role}: master_address={master_address}, master_port={master_port}, "
+        f"rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}, "
+        f"current device id {torch.cuda.current_device()} "
+        f"CUDA_VISIBLE_DEVICES {os.environ.get('CUDA_VISIBLE_DEVICES')} "
+        f"Local rank env {os.environ.get('LOCAL_RANK')} DEVICE env {os.environ.get('DEVICE')} "
+        f"Global rank env {os.environ.get('RANK')}"
+    )
+
+    from sglang.srt.utils import init_custom_process_group
+
+    try:
+        group = init_custom_process_group(
+            backend=backend,
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=rank,
+            group_name=group_name,
+        )
+        logger.info(f"Initialized custom process group: {group}")
+        return group
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize custom process group: {e}.")
+
