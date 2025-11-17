@@ -277,3 +277,24 @@ def compare_and_log_tensor_differences(
 
     return True
 
+
+def compute_statistics(stage_history: dict, step_id: int, duration: float, stage: str):
+    if stage not in stage_history:
+        stage_history[stage] = []
+    history = stage_history[stage]
+    history.append(duration)
+    if len(history) > 10000:
+        history.pop(0)
+    if step_id == 2:
+        # first step contains init time
+        history.pop(history.index(max(history)))
+    num_updates = len(history)
+    stage_history[stage] = history = sorted(history)
+    avg_time = sum(history) / num_updates
+    median_time = history[num_updates // 2]
+    max_time = history[-1]
+    min_time = history[0]
+    logger.info(
+        f"{stage} time statistics for step {step_id}: average time: {avg_time:.4f} seconds, median time: {median_time:.4f} seconds, "
+        f"min time: {min_time:.4f} seconds,  max time: {max_time:.4f} seconds"
+    )
