@@ -19,7 +19,7 @@ from awex.sharding.param_sharding import (
 )
 from awex.util.common import (
     compute_statistics,
-    check_train_infer_params_meta,
+    check_train_infer_params_meta, simple_server_args, simple_hg_config,
 )
 from awex.util.common import stripped_env_vars
 from awex.util.tensor_util import (
@@ -123,8 +123,8 @@ class WeightsExchangeShardingReader(WeightExchangeReader):
         self.infer_conf = {
             "infer_atten_tp_size": self.meta_resolver.rank0_info.attn_tp_size,
             "router_dtype": getattr(self.hf_config, "router_dtype", "bf16"),
-            "server_args": self.sgl_args,
-            "hf_config": self.hf_config,
+            "server_args": simple_server_args(self.sgl_args),
+            "hf_config": simple_hg_config(self.hf_config),
             "infer_world_size": self.infer_world_size,
         }
         self.meta_server_client.put_object("infer_conf", self.infer_conf)
