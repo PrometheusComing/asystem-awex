@@ -347,3 +347,72 @@ def check_train_infer_params_meta(
             else:
                 logger.error(error_msg)
 
+
+def setup_batch_isend_irecv(
+    process_group, rank, world_size, tensor_size=10 * 10, dtype=torch.float32
+):
+    """
+    Perform a simple communication using batch_isend_irecv to avoid the hang for later sub-ranks.
+
+    Args:
+    process_group (ProcessGroup): The process group to work on.
+    tensor_size (int): Size of the tensor to send/receive.
+    dtype (torch.dtype): Data type of the tensor.
+    """
+    assert process_group is not None, "Process group cannot be None"
+    device = torch.cuda.current_device()
+    logger.info(
+        f"Setup batch isend irecv for rank {rank} world size {world_size} device {device}"
+    )
+
+    # Create tensors for sending and receiving
+    send_tensor = torch.full(
+        (tensor_size,), rank, dtype=dtype, device=device, requires_grad=False
+    )
+    recv_tensor = torch.zeros(
+        (tensor_size,), dtype=dtype, device=device, requires_grad=False
+    )
+
+    # Prepare the ops for batch_isend_irecv
+    ops = []
+
+    # First half of ranks receive from rank + half
+    mid_point = world_size // 2
+    if rank < mid_point:
+        # First half: receive from rank + half
+        target_rank = rank + mid_point
+        if target_rank < world_size:
+            ops.append(
+                dist.P2POp(dist.irecv, recv_tensor, target_rank, group=process_group)
+            )
+    else:
+        # Second half: send to rank - half
+        target_rank = rank - mid_point
+        if target_rank >= 0:
+            ops.append(
+                dist.P2POp(dist.isend, send_tensor, target_rank, group=process_group)
+            )
+
+    # Execute batch_isend_irecv
+    if ops:
+        reqs = dist.batch_isend_irecv(ops)
+        # Wait for all communications to complete
+        for req in reqs:
+            req.wait()
+
+    # Synchronize
+    torch.cuda.synchronize(device=torch.cuda.current_device())
+    dist.barrier(group=process_group, device_ids=[torch.cuda.current_device()])
+
+    logger.info(
+        f"Simple communication completed for process group of size {world_size}"
+    )
+
+    # Verify the results
+    if rank < mid_point and rank + mid_point < world_size:
+        expected_value = rank + mid_point
+        assert torch.all(recv_tensor == expected_value), (
+            f"Rank {rank} received incorrect data from rank {rank + mid_point}"
+        )
+
+    logger.info("Simple communication verification successful")
