@@ -1,6 +1,6 @@
 import pytest
 import requests
-from awex.meta_server import (
+from awex.meta.meta_server import (
     MetaServer,
     MetaServerClient,
     start_meta_server,
