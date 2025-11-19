@@ -48,7 +48,7 @@ class InferParamMetaResolver(ParamMetaResolver):
         """
         super().__init__(inference_engine.hf_config)
         self._inference_engine = inference_engine
-        self.infer_engine_config = inference_engine.engine.config
+        self.infer_engine_config = inference_engine.config
         self.engine_name = inference_engine.engine_name
         self.convert_params = convert_params
         self.num_engines = num_engines
@@ -74,6 +74,8 @@ class InferParamMetaResolver(ParamMetaResolver):
             )
         self._params_raw_meta = inference_engine.execute_task_in_model_worker(
             self._get_model_param_info,
+            engine_name=self.engine_name,
+            infer_engine_config=self.infer_engine_config,
             engine_rank=engine_rank,
             convert_params=self.convert_params,
         )
@@ -153,9 +155,10 @@ class InferParamMetaResolver(ParamMetaResolver):
             "params_meta": params_meta,
             "model_arch_name": model_arch_name,
         }
-        converter_builder = get_infer_weights_converter(engine_name)
-        sglang_to_hf_weight_converter = converter_builder(
-            model_config=model.config,
+        sglang_to_hf_weight_converter = get_infer_weights_converter(
+            engine_name,
+            model_arch_name,
+            hf_config=model.config,
             infer_engine_config=infer_engine_config,
             rank_info=rank_info,
         )
