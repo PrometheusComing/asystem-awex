@@ -30,7 +30,7 @@ The Awex weight exchange framework consists primarily of three components:
   <img width="85%" alt="Apache Fory logo" src="docs/images/awex_arch.png"><br>
 </div>
 
-The core functional modules of weight exchange consist mainly of 5 parts:
+The core modules of weight exchange consist mainly of 5 parts:
 
 - **Unified training-inference weight convert**: Responsible for converting weights from training and inference engines with **different parallelism strategies and tensor layouts** into a **unified format** for subsequent weight metadata calculation and weight transmission;
 - **Global weight metadata calculation and exchange**: After converting training and inference weights into a unified format, collects all weight shard metadata from each worker and reports to Meta Server for subsequent weight transmission plan construction;
@@ -44,7 +44,7 @@ See more details on our [Document](docs).
 
 ## Performance Benchmarks
 
-On thousand-GPU scale clusters, Awex using NCCL transmission can **complete 10B-scale model weight exchange within one second**, and **complete 1T-scale model weight exchange within twenty seconds**. Using RDMA for transmission, **1T model weight exchange time** can be further **reduced to six seconds**.
+On thousand-GPU scale clusters, Awex using NCCL transmission can **exchange 10B-scale model weights within one second**, and **exchange 1T-scale model weights within twenty seconds**. Using RDMA for transmission, **1T model weight exchange time** can be further **reduced to six seconds**.
 
 | Weight Parameter Scale | Weight Data Size | Verl Time | Awex NCCL Transmission Time | Awex RDMA Transmission Time |
 | ---------------------- | ---------------- | --------- | --------------------------- | --------------------------- |
