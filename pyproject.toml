@@ -34,7 +34,9 @@ requires-python = ">=3.8"
 dependencies = []
 
 [project.optional-dependencies]
-dev = []
+dev = [
+    "modelscope>=1.9.0",  # For faster download models
+]
 
 [project.urls]
 Homepage = "https://github.com/inclusionAI/awex"

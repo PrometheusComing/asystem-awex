@@ -23,11 +23,14 @@ import torch.distributed as dist
 import os
 from concurrent.futures import ThreadPoolExecutor
 import time
+import signal
+import sys
 
 from awex.config import InferenceConfig
 from awex.meta.meta_server import start_meta_server
 from awex.meta.meta_server import MetaServerClient
 from awex.tests.test_utils import megatron_model_from_hf
+from awex.transfer.nccl_comm import nccl_build_recv_ops, batch_send_recv
 from awex.transfer.transfer_plan import TransferPlanBuilder, slice_tensor
 from awex.util.process_group import (
     init_weights_update_group,
@@ -49,14 +52,18 @@ def create_mocked_mcore_engine():
     os.environ["GLOO_USE_LIBUV"] = "0"
     os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
     os.environ["NCCL_SOCKET_IFNAME"] = "eth0"
+    # Training rank uses GPU 1 (logical device index 1 in this process)
     os.environ["LOCAL_RANK"] = "1"
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
     os.environ["DEVICE"] = "1"
+    # Ensure current CUDA device matches DEVICE before Megatron init so
+    # that Megatron constructs its model directly on GPU 1.
+    torch.cuda.set_device(int(os.environ["DEVICE"]))
     ip, port = start_meta_server()
     config = {
         "meta_server_addr": f"{ip}:{port}",
         "comm_backend": "nccl",
-        "enable_debug_mode": False,
+        "enable_debug_mode": True,
     }
     from awex.engine.mcore import MegatronEngine
 
@@ -69,7 +76,25 @@ def create_mocked_mcore_engine():
     reason="Only one GPU present",
 )
 def test_weights_writer():
+    # Create Megatron engine first so that Megatron can initialize its
+    # own parallel state and CUDA context without relying on a
+    # pre-existing default torch process group.
     mcore_engine = create_mocked_mcore_engine()
+    # Initialize process group for the writer side on GPU 1
+    torch.cuda.set_device(1)
+    os.environ["RANK"] = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+    os.environ["DEVICE"] = "1"
+    os.environ["LOCAL_RANK"] = "1"
+    init_process_group(0, 1, get_free_port())
+    # Initialize Megatron parallel state
+    from megatron.core import parallel_state as mpu
+    mpu.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+
+    mcore_engine.initialize()
     weights_writer = mcore_engine.weights_exchange_writer
     print(f"backend.meta_server_addr: {mcore_engine.meta_server_addr}")
     meta_server_client = MetaServerClient(*mcore_engine.meta_server_addr.split(":"))
@@ -90,6 +115,9 @@ def test_weights_writer():
     mp.set_start_method("spawn", force=True)
     p = mp.Process(target=weights_reader, args=(mcore_engine.meta_server_addr,))
     p.start()
+    while not p.is_alive():
+        time.sleep(0.1)
+    logger.info(f"Starting reader process {p.pid}")
 
     # Wait for the reader to put master_info
     max_wait_time = 30
@@ -99,8 +127,8 @@ def test_weights_writer():
             master_info = meta_server_client.get_object("master_info", timeout=1)
             logger.info(f"Found master_info: {master_info}")
             break
-        except Exception:
-            logger.exception("Failed to get master info")
+        except Exception as e:
+            logger.error(f"Failed to get master info: {e}")
             time.sleep(0.5)
     else:
         raise TimeoutError("Reader did not put master_info within 30 seconds")
@@ -117,8 +145,24 @@ def test_weights_writer():
     weights_writer.write_weights(step_id=0)
     weights_writer.finish_step(step_id=0)
 
-    # Wait for the reader process to finish
-    p.kill()
+    # Wait for the reader process to finish with timeout
+    p.join(timeout=10)
+    if p.is_alive():
+        logger.warning("Reader process did not finish, terminating...")
+        p.terminate()
+        p.join(timeout=5)
+        if p.is_alive():
+            logger.error("Reader process did not terminate, killing...")
+            p.kill()
+            p.join()
+
+    # Clean up process group
+    try:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception as e:
+        logger.error(f"Error destroying process group: {e}")
+
     os.environ.clear()
     os.environ.update(_env_backup)
 
@@ -131,10 +175,23 @@ def init_process_group(rank, world_size, port):
     os.environ["WORLD_SIZE"] = str(world_size)
 
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(0)
 
 
 def weights_reader(meta_server_addr):
+    # Set up signal handler for graceful shutdown
+    def cleanup_and_exit(signum, frame):
+        logger.info(f"Received signal {signum}, cleaning up...")
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+        finally:
+            sys.exit(1)
+
+    signal.signal(signal.SIGINT, cleanup_and_exit)
+    signal.signal(signal.SIGTERM, cleanup_and_exit)
+
     os.environ["LOCAL_RANK"] = "0"
     os.environ["DEVICE"] = "0"
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
@@ -184,6 +241,7 @@ def weights_reader(meta_server_addr):
         len(operations) for operations in transfer_plan.operations.values()
     )
     logger.info(f"Number of operations of reads: {num_operations}")
+    logger.info(f"Transfer plan operations by rank: {[(rank, len(ops)) for rank, ops in transfer_plan.operations.items()]}")
     weights_update_group = init_weights_update_group(
         master_address=master_address,
         master_port=master_port,
@@ -210,56 +268,62 @@ def weights_reader(meta_server_addr):
             )
         break
 
-    tensors_map = {}
+    # Parameters are keyed by their shard name to mirror how the writer passes tensors.
+    parameters = {}
+    logger.info(f"Create tensors at device cuda:{torch.cuda.current_device()}")
     for rank, operations in transfer_plan.operations.items():
         for operation in operations:
+            param_name = operation.recv_shard_meta.name
+            if param_name in parameters:
+                continue
             tensor = torch.ones(
                 operation.recv_shard_meta.shape,
                 device=f"cuda:{torch.cuda.current_device()}",
-                dtype=operation.send_shard_meta.dtype,
+                dtype=operation.recv_shard_meta.dtype,
             )
-            tensors_map[id(operation)] = tensor
+            parameters[param_name] = tensor
     torch.cuda.synchronize(device=torch.cuda.current_device())
-    p2p_ops = []
-    for rank, operations in transfer_plan.operations.items():
-        logger.info(f"Start to recv from rank: {rank}, operations {operations[:5]} ")
-        for operation in operations:
-            tensor = tensors_map[id(operation)]
-            original_shape = tensor.shape
-            tensor = slice_tensor(tensor, operation, False)
-            logger.info(
-                f"Tensor {operation.recv_shard_meta.name}: original_shape={original_shape}, "
-                f"sliced_shape={tensor.shape}, dtype={tensor.dtype}"
-            )
-            p2p_op = dist.P2POp(
-                dist.irecv,
-                tensor,
-                rank,
-                group=weights_update_group,
-            )
-            p2p_ops.append(p2p_op)
-    logger.info(f"Start to batch recv weights with {len(p2p_ops)} operations")
+
+    # Build recv operations in round-robin order to match the sender's round-robin pattern
+    # The sender uses nccl_build_send_ops which interleaves operations across ranks
+    all_ranks = list(transfer_plan.operations.keys())  # Preserve plan's order
+    p2p_ops = nccl_build_recv_ops(parameters, transfer_plan, weights_update_group)
+    logger.info(f"Reader (rank 0): Building recv operations from sender ranks: {all_ranks}")
+
 
     # Debug: Check if tensors are properly allocated
-    logger.info("Debug: Checking tensor allocation")
-    for i, operation in enumerate(list(transfer_plan.operations.values())[0][:3]):
-        tensor = tensors_map[id(operation)]
+    logger.info("Debug: Verifying recv operations were created correctly")
+    first_rank = list(transfer_plan.operations.keys())[0]
+    first_ops = transfer_plan.operations[first_rank][:3]
+    for i, operation in enumerate(first_ops):
+        tensor = parameters[operation.recv_shard_meta.name]
         logger.info(
             f"Tensor {i}: {operation.recv_shard_meta.name}, "
             f"shape={tensor.shape}, dtype={tensor.dtype}, "
             f"device={tensor.device}, is_contiguous={tensor.is_contiguous()}"
         )
 
-    reqs = dist.batch_isend_irecv(p2p_ops)
-    logger.info(f"Started batch_isend_irecv with {len(reqs)} requests")
+    logger.info(f"Start to receive weights with {len(p2p_ops)} operations")
 
-    # Wait for each request with timeout
-    for i, req in enumerate(reqs):
-        req.wait()
-
+    # Execute recv operations via batch_send_recv to share the same
+    # scheduling and stream assignment logic as the production reader.
+    logger.info(
+        f"Test reader: Executing {len(p2p_ops)} recv ops via batch_send_recv"
+    )
+    batch_send_recv(send_ops=[], recv_ops=p2p_ops, blocking=True, use_group=True)
+    logger.info("All recv operations completed, synchronizing CUDA")
     torch.cuda.synchronize(device=torch.cuda.current_device())
     logger.info("Finished receiving weights")
-    dist.barrier(group=weights_update_group, device_ids=[torch.cuda.current_device()])
+
+    # Barrier can also hang, so add timeout
+    logger.info("Waiting at barrier")
+    try:
+        dist.barrier(group=weights_update_group, device_ids=[torch.cuda.current_device()])
+        logger.info("Barrier completed")
+    except TimeoutError:
+        logger.error("Barrier timed out")
+        raise
+
     logger.info("Start to destroy process group")
     dist.destroy_process_group()
     logger.info("Destroyed process group")

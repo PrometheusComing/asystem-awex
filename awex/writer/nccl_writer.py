@@ -22,7 +22,7 @@ import time
 
 import torch
 
-from awex.transfer.nccl_comm import nccl_build_send_ops
+from awex.transfer.nccl_comm import nccl_build_send_ops, batch_send_recv
 from awex.transfer.transfer_plan import TransferPlanBuilder, slice_tensor
 from awex.util.common import get_ip_address, compute_statistics
 from awex.util.gpu import print_current_gpu_status
@@ -61,6 +61,8 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             self.transfer_rank,
         )
         self.recv_ranks = list(self.transfer_plan.operations.keys())
+        logger.info(f"Writer rank {self.transfer_rank}: Built transfer plan to send to ranks: {self.recv_ranks}")
+        logger.info(f"Writer rank {self.transfer_rank}: Operations per rank: {[(rank, len(ops)) for rank, ops in self.transfer_plan.operations.items()]}")
         self.recv_ranks_sample = (
             self.recv_ranks[:8] + ["..."] + self.recv_ranks[-8:]
             if len(self.recv_ranks) > 16
@@ -157,17 +159,28 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         """
         rank_coordinate = self.transfer_rank
         logger.info(
-            f"Start to send weights using NCCL to {len(self.transfer_plan.operations)} ranks({self.recv_ranks_sample}) "
-            f"from rank {rank_coordinate} with {self.num_to_sends} sends"
+            f"Start to send weights using NCCL to {len(self.transfer_plan.operations)} "
+            f"ranks({self.recv_ranks_sample}) from rank {rank_coordinate} "
+            f"with {self.num_to_sends} sends"
         )
         start_time = time.time()
         parameters = self.convert_parameters()
+        logger.info("Writer: Converting parameters completed, building send ops")
         p2p_op_list, _ = nccl_build_send_ops(
             parameters, self.transfer_plan, self.weights_update_group, -1
         )
-        reqs = dist.batch_isend_irecv(p2p_op_list)
-        for req in reqs:
-            req.wait()
+        logger.info(
+            f"Writer: Built {len(p2p_op_list)} send operations to "
+            f"{len(self.transfer_plan.operations)} ranks"
+        )
+
+        # Execute all sends via batch_send_recv to get consistent interleaving
+        # and per-peer stream assignment without relying directly on
+        # batch_isend_irecv.
+        logger.info(
+            f"Writer: Executing {len(p2p_op_list)} send ops via batch_send_recv"
+        )
+        batch_send_recv(send_ops=p2p_op_list, recv_ops=[], blocking=True, use_group=True)
         torch.cuda.synchronize(device=torch.cuda.current_device())
         duration = time.time() - start_time
         logger.info(
