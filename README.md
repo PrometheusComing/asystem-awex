@@ -42,6 +42,8 @@ Awex also supports tensor-level validation of weights, comparing weights loaded 
 
 See more details on our [Document](docs).
 
+For comprehensive introduction about awex, see the [medium article](https://medium.com/@shawn.ck.yang/awex-an-ultra-fast-weight-sync-framework-powering-trillion-scale-reinforcement-learning-766ebc79f58b)
+
 ## Performance Benchmarks
 
 On thousand-GPU scale clusters, Awex using NCCL transmission can **exchange 10B-scale model weights within one second**, and **exchange 1T-scale model weights within twenty seconds**. Using RDMA for transmission, **1T model weight exchange time** can be further **reduced to six seconds**.
