@@ -375,12 +375,19 @@ def execute_p2p_op_list(p2p_op_list, stage: str, weights_update_group):
 
 
 @torch.no_grad()
-def nccl_build_send_ops(parameters, transfer_plan, weights_update_group, copy_rank):
+def nccl_build_send_ops(
+    parameters,
+    transfer_plan,
+    weights_update_group,
+    copy_rank,
+    use_batch_send_recv: bool = True,
+):
     mem_debug = os.environ.get("AWEX_MEM_DEBUG", "0") == "1"
     send_progress = dict.fromkeys(transfer_plan.operations.keys(), 0)
     unfinished_ranks = set(transfer_plan.operations.keys())
     p2p_op_list = []
     copy_op_list = []
+    send_traj_list = []
     train_slice_context = {}
     while len(unfinished_ranks) > 0:
         finished_ranks = set()
@@ -397,6 +404,8 @@ def nccl_build_send_ops(parameters, transfer_plan, weights_update_group, copy_ra
                 if recv_rank == copy_rank:
                     copy_op_list.append(tensor_sliced)
                 else:
+                    if not use_batch_send_recv:
+                        send_traj_list.append((op.send_shard_meta.name, recv_rank))
                     p2p_op_list.append(
                         dist.P2POp(
                             dist.isend,
@@ -432,13 +441,18 @@ def nccl_build_send_ops(parameters, transfer_plan, weights_update_group, copy_ra
             p2p_bytes,
             len(unique_ptrs),
         )
-    return p2p_op_list, copy_op_list
+    return p2p_op_list, copy_op_list, send_traj_list
 
 
 def nccl_build_recv_ops(
-    parameters: Dict[str, torch.Tensor], transfer_plan, weights_update_group
+    parameters: Dict[str, torch.Tensor],
+    transfer_plan,
+    weights_update_group,
+    use_batch_send_recv: bool = True,
 ):
     p2p_op_list = []
+    non_contiguous_tensor_pairs = []
+    recv_traj_list = []
     recv_progress = dict.fromkeys(transfer_plan.operations.keys(), 0)
     unfinished_ranks = set(transfer_plan.operations.keys())
     while len(unfinished_ranks) > 0:
@@ -451,6 +465,12 @@ def nccl_build_recv_ops(
                 op = operations[progress]
                 recv_tensor = parameters[op.recv_shard_meta.name]
                 tensor_sliced = slice_tensor(recv_tensor, op, False)
+                if not tensor_sliced.is_contiguous() and use_batch_send_recv:
+                    original_tensor = tensor_sliced
+                    tensor_sliced = tensor_sliced.contiguous()
+                    non_contiguous_tensor_pairs.append((original_tensor, tensor_sliced))
+                if not use_batch_send_recv:
+                    recv_traj_list.append((op.recv_shard_meta.name, send_rank))
                 p2p_op_list.append(
                     dist.P2POp(
                         dist.irecv,
@@ -464,7 +484,7 @@ def nccl_build_recv_ops(
                 finished_ranks.add(send_rank)
         for rank in finished_ranks:
             unfinished_ranks.remove(rank)
-    return p2p_op_list
+    return p2p_op_list, non_contiguous_tensor_pairs, recv_traj_list
 
 
 def _interleave_p2p_ops_by_peer(ops: Sequence[dist.P2POp]) -> List[dist.P2POp]:

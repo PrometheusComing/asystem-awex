@@ -131,6 +131,11 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         self.num_infer_engines = None
         self.engine_name = train_engine.engine_name
         self.enable_mem_debug = os.environ.get("AWEX_MEM_DEBUG", "0") == "1"
+        self.already_initialized = False
+        self.destroy_pg_after_update = (
+            os.getenv("AWEX_DESTROY_PG_AFTER_UPDATE", "0") == "1"
+        )
+        self.use_batch_send_recv = os.getenv("AWEX_USE_BATCH_SEND_RECV", "1") == "1"
 
     def initialize(self, **kwargs):
         pass

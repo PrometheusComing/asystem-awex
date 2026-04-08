@@ -712,43 +712,26 @@ class WorkerWeightsReader:
         # are non-contiguous views. NCCL recv requires contiguous tensors, so we
         # receive into contiguous buffers and copy back to these views after recv.
         self._noncontiguous_parameter_views: Dict[str, torch.Tensor] = {}
+
+        self.already_initialized = False
+        self.destroy_pg_after_update = (
+            os.getenv("AWEX_DESTROY_PG_AFTER_UPDATE", "0") == "1"
+        )
+        self.use_batch_send_recv = os.getenv("AWEX_USE_BATCH_SEND_RECV", "1") == "1"
+        self.parameters = {}
         logger.info(f"Env varabbles for weights reader: {stripped_env_vars()}")
         logger.info(
             f"Created weights reader for rank {self.rank_info.global_rank}, engine rank {self.engine_rank}"
         )
 
     def initialize(self):
-        self.parameters = {}
-        self._noncontiguous_parameter_views = {}
-        non_contiguous = []
-        non_contiguous_bytes = 0
-        for name, param in self.model.named_parameters():
-            for hf_name, hf_param in self.weight_converter.convert_param(name, param):
-                if hf_param.is_contiguous():
-                    self.parameters[hf_name] = hf_param
-                    continue
-                recv_buffer = torch.empty_like(hf_param).contiguous()
-                recv_buffer.copy_(hf_param)
-                self.parameters[hf_name] = recv_buffer
-                self._noncontiguous_parameter_views[hf_name] = hf_param
-                non_contiguous.append((hf_name, tuple(hf_param.shape)))
-                non_contiguous_bytes += hf_param.numel() * hf_param.element_size()
-        if non_contiguous:
-            sample = ", ".join(f"{name}:{shape}" for name, shape in non_contiguous[:8])
-            logger.info(
-                "Reader rank %s uses contiguous recv buffers for %s non-contiguous params "
-                "(~%.2f MiB, showing up to 8): %s",
-                self.rank_info.global_rank,
-                len(non_contiguous),
-                non_contiguous_bytes / (1024 * 1024),
-                sample,
-            )
-            if len(non_contiguous) > 8:
-                logger.debug(
-                    "Reader rank %s remaining buffered params: %s",
-                    self.rank_info.global_rank,
-                    [name for name, _ in non_contiguous[8:]],
-                )
+        self.parameters = {
+            hf_name: hf_param
+            for name, param in self.model.named_parameters()
+            for hf_name, hf_param in self.weight_converter.convert_param(name, param)
+        }
+
+        # todo check this param
         if (
             getattr(self.hf_config, "tie_word_embeddings", False)
             and self.rank_info.pp_rank == self.rank_info.pp_size - 1
@@ -762,12 +745,6 @@ class WorkerWeightsReader:
             logger.info(
                 "WeightsReader: added lm_head.weight alias for tied embeddings."
             )
-
-    def _sync_noncontiguous_parameter_views(self):
-        if not self._noncontiguous_parameter_views:
-            return
-        for name, target_view in self._noncontiguous_parameter_views.items():
-            target_view.copy_(self.parameters[name])
 
     def pre_update_weights(self, step_id, **kwargs):
         pass
@@ -812,7 +789,6 @@ class WorkerWeightsReader:
                 )
             )
         self.read_tensors(step_id, tensor_pairs, **kwargs)
-        self._sync_noncontiguous_parameter_views()
         self.finish_step(step_id)
         logger.info(
             f"Finished updating weights for step {step_id} for rank {self.engine_rank}-{self.rank_info.global_rank}"

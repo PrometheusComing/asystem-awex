@@ -70,17 +70,12 @@ class SGlangToHFWeightConverter:
     def _use_transposed_moe_layout(self, name: str, parameter: torch.Tensor) -> bool:
         if self.device_backend != "npu" or parameter.ndim != 2:
             return False
-        # vLLM-ascend fused MoE kernels keep expert MLP weights in transposed layout.
-        return "experts" in name or "shared_experts" in name
+        # vLLM-ascend only transposes normal experts
+        return "experts" in name and "shared_experts" not in name
 
     def _split_gate_up(
         self, name: str, parameter: torch.Tensor
     ) -> List[Tuple[str, torch.Tensor]]:
-        if self._use_transposed_moe_layout(name, parameter):
-            # vLLM-ascend stores MoE fc1 in transposed layout [H, 2I].
-            # Build canonical views [2I, H] first so transfer/meta remain in
-            # canonical HF/Megatron orientation.
-            parameter = parameter.transpose(0, 1)
         split_dim = 0
         shape_split = parameter.shape[split_dim]
         stride = shape_split // 2
@@ -162,35 +157,28 @@ class SGlangToHFWeightConverter:
             mlp.down_proj.weight
             mlp.w13_weight
             mlp.w2_weight
+            mlp.shared_experts.gate_up_proj.weight
+            mlp.shared_experts.down_proj.weight
         Return example:
             mlp.gate_up_proj.weight
             mlp.down_proj.weight
         """
+        if self._use_transposed_moe_layout(name, parameter):
+            parameter = parameter.transpose(0, 1)
         if "gate_up_proj" in name:
             if self._fuse_gate_up_proj(name):
                 # Keep fused format
                 return [(name, parameter)]
             else:
-                # Split into separate gate and up projections.
-                # On vLLM-ascend MoE, gate_up tensors are transposed and must be split on dim=1.
                 return self._split_gate_up(name, parameter)
         elif "down_proj" in name:
-            if self._use_transposed_moe_layout(name, parameter):
-                # vLLM-ascend stores MoE fc2 in transposed layout [I, H].
-                # Expose canonical view [H, I].
-                parameter = parameter.transpose(0, 1)
             return [(name, parameter)]
         elif "w13_weight" in name:
-            # Handle MoE expert weights (w13_weight contains both gate and up projections)
             if self._fuse_gate_up_proj(name):
                 return [(name.replace("w13_weight", "gate_up_proj.weight"), parameter)]
             else:
-                # On vLLM-ascend MoE, w13 tensors are transposed and must be split on dim=1.
                 return self._split_gate_up(name, parameter)
         elif "w2_weight" in name:
-            # Handle MoE expert down projection
-            if self._use_transposed_moe_layout(name, parameter):
-                parameter = parameter.transpose(0, 1)
             return [(name.replace("w2_weight", "down_proj.weight"), parameter)]
         else:
             raise NotImplementedError(f"Unsupported MLP parameter name: {name}")
@@ -253,6 +241,9 @@ class SGlangToHFWeightConverter:
         # w2_weight shape: num_experts_per_partition, hidden_size, intermediate_size
         if "expert_bias" in name:
             return [(name, parameter)]
+        if "shared_experts" in name:
+            # shared_experts not fused with normal experts
+            return self._convert_mlp_param(name, parameter, layer_number)
         converted_params = []
         num_local_experts = parameter.shape[0]
 

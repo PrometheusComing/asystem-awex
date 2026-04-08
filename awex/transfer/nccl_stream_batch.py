@@ -20,6 +20,7 @@ import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
+import torch
 import torch.distributed as dist
 
 from awex import logging
@@ -86,6 +87,7 @@ class NcclColocateStreamBatchTransport:
         all_recv_p2p_ops = {}  # peer_rank -> List[(plan_op, p2p_op)]
         tensors_to_copy = []
         train_slice_context = {}
+        non_contiguous_tensor_pairs = []
 
         # Process send operations
         for peer_rank, ops in send_ops.items():
@@ -130,6 +132,10 @@ class NcclColocateStreamBatchTransport:
             for op in ops:
                 recv_tensor = recv_parameters[op.recv_shard_meta.name]
                 tensor_sliced = slice_tensor(recv_tensor, op, False)
+                if not tensor_sliced.is_contiguous():
+                    original_tensor = tensor_sliced
+                    tensor_sliced = tensor_sliced.contiguous()
+                    non_contiguous_tensor_pairs.append((original_tensor, tensor_sliced))
                 p2p_op = dist.P2POp(
                     dist.irecv if async_op else dist.recv,
                     tensor_sliced,
@@ -169,7 +175,12 @@ class NcclColocateStreamBatchTransport:
             rank_coordinate,
             step_id,
         )
-
+        if non_contiguous_tensor_pairs:
+            with torch.no_grad():
+                for original_tensor, recv_tensor in non_contiguous_tensor_pairs:
+                    original_tensor.copy_(recv_tensor)
+                non_contiguous_tensor_pairs.clear()
+                del non_contiguous_tensor_pairs
         device_util.synchronize()
         future.set_result(True)
         duration = time.time() - start_time
