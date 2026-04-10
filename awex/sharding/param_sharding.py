@@ -44,7 +44,15 @@ _default_parameter_sharding_dimensions = {
     "q_proj.weight": 0,
     "k_proj.weight": 0,
     "v_proj.weight": 0,
+    "g_proj.weight": 0,
+    "q_a_proj.weight": 0,
+    "q_b_proj.weight": 0,
+    "kv_a_proj_with_mqa.weight": 0,
+    "kv_b_proj.weight": 0,
+    "fused_qkv_a_proj_with_mqa.weight": 0,
     "dense.weight": 1,
+    "o_proj.weight": 1,
+    "g_norm.weight": 0,
     # Attention layers - biases
     "query_key_value.bias": 0,
     "q_proj.bias": 0,
@@ -279,6 +287,31 @@ class ShardingStrategy:
             parameter_name, get_default_sharding_dim(parameter_name)
         )
         return ShardingType.TP_SHARDING, sharding_dim, tp_size
+
+
+class LinearMLAShardingMixin:
+    def get_sharding_strategy(self, parameter_name, **kwargs):
+        if any(
+            key in parameter_name
+            for key in (
+                "attention.kv_a_proj_with_mqa.weight",
+                "attention.q_a_proj.weight",
+                "attention.fused_qkv_a_proj_with_mqa.weight",
+                "attention.kv_a_layernorm.weight",
+                "attention.q_a_layernorm.weight",
+            )
+        ):
+            sharding_dim = get_default_sharding_dim(parameter_name)
+            return ShardingType.NO_SHARDING, sharding_dim, 1
+
+        if "attention.g_norm.weight" in parameter_name:
+            sharding_dim = get_default_sharding_dim(parameter_name)
+            tp_size = self.rank_info.tp_size
+            if tp_size > 1:
+                return ShardingType.TP_SHARDING, sharding_dim, tp_size
+            return ShardingType.NO_SHARDING, sharding_dim, 1
+
+        return super().get_sharding_strategy(parameter_name, **kwargs)
 
 
 def get_sharding_strategy_builder(engine_name: str):
