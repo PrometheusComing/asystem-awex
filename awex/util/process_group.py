@@ -218,12 +218,24 @@ def init_weights_update_group(
     )
 
     try:
+        options = None
+        if backend == "hccl":
+            import torch_npu
+
+            options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+            # first,using specified buffer size instead of global buffer size while large size has higher throughput,
+            # because the memory used is 2 * buffer_size MB.
+            # second,rollout and actor must have a same buffer size for group init.
+            options.hccl_config = {
+                "hccl_buffer_size": int(os.getenv("AWEX_P2P_HCCL_BUFFER_SIZE", "200"))
+            }
         group = init_custom_process_group(
             backend=backend,
             init_method=f"tcp://{master_address}:{master_port}",
             world_size=world_size,
             rank=rank,
             group_name=group_name,
+            pg_options=options,
         )
         logger.info(f"Initialized custom process group: {group}")
         return group

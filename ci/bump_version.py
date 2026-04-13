@@ -4,10 +4,11 @@ import argparse
 import re
 from pathlib import Path
 
-
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 VERSION_LINE_PATTERN = re.compile(r'(?m)^__version__ = "[^"]+"$')
-DEFAULT_TARGET = Path(__file__).resolve().parent.parent / "awex" / "reader" / "__init__.py"
+DEFAULT_TARGET = (
+    Path(__file__).resolve().parent.parent / "awex" / "reader" / "__init__.py"
+)
 
 
 def parse_args() -> argparse.Namespace:

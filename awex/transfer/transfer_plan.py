@@ -702,6 +702,9 @@ def slice_tensor(
     """
     slices = op.train_slices if is_train else op.inf_slices
     sliced_tensor = tensor[slices]
+    if not is_train:
+        # sliced_tensor for infer may not be contiguous
+        return sliced_tensor
     if not sliced_tensor.is_contiguous():
         param_name = op.send_shard_meta.name
         source_offset = op.send_offset if is_train else op.recv_offset

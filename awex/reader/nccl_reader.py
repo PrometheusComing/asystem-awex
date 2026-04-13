@@ -101,87 +101,18 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"Start to initialize NCCL weights writer for rank {self.transfer_rank}"
         )
 
-        from awex.util.process_group import (
-            init_weights_update_group,
-            setup_batch_isend_irecv,
-        )
-
-        gpu_id = getattr(self.scheduler, "gpu_id", None) or getattr(
-            self.scheduler, "local_rank", None
-        )
-        if gpu_id is None:
-            gpu_id = int(os.environ.get("LOCAL_RANK", 0))
-        device_type = device_util.get_device_type()
-        device_count = device_util.device_count() or 1
-        if device_type == "cuda":
-            prev_device = torch.cuda.current_device()
-            logger.info(
-                f"[NCCLWeightsReader] Set device to {gpu_id} for rank {self.transfer_rank}, "
-                f"device env is {os.environ.get('DEVICE')}, "
-                f"previous device is {prev_device}, "
-                f"device_count is {device_count}, "
-                f"CUDA_VISIBLE_DEVICES env is {os.environ.get('CUDA_VISIBLE_DEVICES')}"
-            )
-            torch.cuda.set_device(gpu_id)
-            barrier_device = torch.cuda.current_device()
-            backend = "nccl"
-            ready_tensor = torch.tensor(1).cuda()
-        else:
-            logger.info(
-                f"[NCCLWeightsReader] Set device to {gpu_id} for rank {self.transfer_rank}, "
-                f"device env is {os.environ.get('DEVICE')}, "
-                f"previous device is {device_util.current_device()}, "
-                f"device_count is {device_count}, "
-                f"{'/'.join(device_util.visible_devices_env_names())} env is {device_util.visible_devices_env_value() or '(unset)'}"
-            )
-            device_util.set_device(gpu_id)
-            barrier_device = device_util.current_device()
-            backend = self.comm_backend
-            ready_tensor = torch.tensor(1, device=device_util.get_torch_device())
-        world_size = (
+        self.master_address = master_address
+        self.master_port = master_port
+        self.world_size = (
             self.infer_world_size
             if self.enable_colocate_mode
             else self.transfer_world_size
         )
-        self.weights_update_group = init_weights_update_group(
-            master_address=master_address,
-            master_port=master_port,
-            rank=self.transfer_rank,
-            world_size=world_size,
-            group_name="weights_exchange",
-            backend=backend,
-            role="inference",
-        )
-        logger.info(
-            f"Initialized NCCL weights reader for rank {self.transfer_rank}, engine rank {self.engine_rank}"
-        )
-        # Add a barrier to ensure all processes are ready
-        dist.barrier(group=self.weights_update_group, device_ids=[barrier_device])
-        logger.info(f"Barrier passed for weights reader with rank {self.transfer_rank}")
-        if self.transfer_rank == 0:
-            logger.info(
-                f"Start to test NCCL ready for rank {self.transfer_rank}, world size {self.transfer_world_size}"
-            )
-            dist.recv(
-                ready_tensor,
-                src=world_size - 1,
-                group=self.weights_update_group,
-            )
-            logger.info(
-                f"NCCL ready: recv tensor from rank 0 for rank {self.transfer_rank}"
-            )
-        if (
-            self.enable_colocate_mode
-            and self.transfer_rank == self.infer_world_size - 1
-        ):
-            dist.send(
-                ready_tensor,
-                dst=0,
-                group=self.weights_update_group,
-            )
-        setup_batch_isend_irecv(
-            self.weights_update_group, self.transfer_rank, world_size
-        )
+
+        self._set_device()
+        self._init_weights_exchange_process_group()
+        self._shake_hands_with_writer()
+
         self.send_ranks = list(self.transfer_plan.operations.keys())
         self.send_ranks_sample = (
             self.send_ranks[:8] + ["..."] + self.send_ranks[-8:]
@@ -200,6 +131,102 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         logger.info(
             f"Created NCCL weights reader for rank {self.rank_info.global_rank}, engine rank {self.engine_rank}"
         )
+
+    def _shake_hands_with_writer(self):
+        from awex.util.process_group import (
+            setup_batch_isend_irecv,
+        )
+
+        if self.transfer_rank == 0:
+            logger.info(
+                f"Start to test NCCL ready for rank {self.transfer_rank}, world size {self.transfer_world_size}"
+            )
+            dist.recv(
+                self.ready_tensor,
+                src=self.world_size - 1,
+                group=self.weights_update_group,
+            )
+            logger.info(
+                f"NCCL ready: recv tensor from rank 0 for rank {self.transfer_rank}"
+            )
+        if (
+            self.enable_colocate_mode
+            and self.transfer_rank == self.infer_world_size - 1
+        ):
+            dist.send(
+                self.ready_tensor,
+                dst=0,
+                group=self.weights_update_group,
+            )
+        setup_batch_isend_irecv(
+            self.weights_update_group, self.transfer_rank, self.world_size
+        )
+
+    def _set_device(self):
+        gpu_id = getattr(self.scheduler, "gpu_id", None) or getattr(
+            self.scheduler, "local_rank", None
+        )
+        if gpu_id is None:
+            gpu_id = int(os.environ.get("LOCAL_RANK", 0))
+        device_type = device_util.get_device_type()
+        device_count = device_util.device_count() or 1
+        if device_type == "cuda":
+            prev_device = torch.cuda.current_device()
+            logger.info(
+                f"[NCCLWeightsReader] Set device to {gpu_id} for rank {self.transfer_rank}, "
+                f"device env is {os.environ.get('DEVICE')}, "
+                f"previous device is {prev_device}, "
+                f"device_count is {device_count}, "
+                f"CUDA_VISIBLE_DEVICES env is {os.environ.get('CUDA_VISIBLE_DEVICES')}"
+            )
+            torch.cuda.set_device(gpu_id)
+            self.barrier_device = torch.cuda.current_device()
+            self.backend = "nccl"
+            self.ready_tensor = torch.tensor(1).cuda()
+        else:
+            logger.info(
+                f"[NCCLWeightsReader] Set device to {gpu_id} for rank {self.transfer_rank}, "
+                f"device env is {os.environ.get('DEVICE')}, "
+                f"previous device is {device_util.current_device()}, "
+                f"device_count is {device_count}, "
+                f"{'/'.join(device_util.visible_devices_env_names())} env is {device_util.visible_devices_env_value() or '(unset)'}"
+            )
+            device_util.set_device(gpu_id)
+            self.barrier_device = device_util.current_device()
+            self.backend = self.comm_backend
+            self.ready_tensor = torch.tensor(1, device=device_util.get_torch_device())
+
+    def _init_weights_exchange_process_group(self):
+        if self.already_initialized:
+            return
+        from awex.util.process_group import (
+            init_weights_update_group,
+        )
+
+        self.weights_update_group = init_weights_update_group(
+            master_address=self.master_address,
+            master_port=self.master_port,
+            rank=self.transfer_rank,
+            world_size=self.world_size,
+            group_name="weights_exchange",
+            backend=self.backend,
+            role="inference",
+        )
+        logger.info(
+            f"Initialized NCCL weights reader for rank {self.transfer_rank}, engine rank {self.engine_rank}"
+        )
+        # Add a barrier to ensure all processes are ready
+        dist.barrier(group=self.weights_update_group, device_ids=[self.barrier_device])
+        logger.info(f"Barrier passed for weights reader with rank {self.transfer_rank}")
+        self.already_initialized = True
+
+    def _destroy_weights_exchange_process_group(self):
+        # reduce the impact of process group to avoid oom in infer
+        if self.destroy_pg_after_update and self.backend == "hccl":
+            self.already_initialized = False
+            torch.distributed.destroy_process_group(self.weights_update_group)
+            torch.npu.synchronize()
+            torch.npu.empty_cache()
 
     def _init_reader_in_colocate_mode(self):
         self.meta_server_client.add_object_to_set(
@@ -299,6 +326,16 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         )
         logger.info(f"Open fds after deserialization: {count_open_fds()}")
 
+    @staticmethod
+    def _sync_non_contiguous_tensor_pairs(non_contiguous_tensor_pairs):
+        if not non_contiguous_tensor_pairs:
+            return
+        with torch.no_grad():
+            for original_tensor, recv_tensor in non_contiguous_tensor_pairs:
+                original_tensor.copy_(recv_tensor)
+            non_contiguous_tensor_pairs.clear()
+            del non_contiguous_tensor_pairs
+
     def _update_weights(self, step_id, **kwargs):
         """
         Asynchronously receive weights from training ranks using torch.distributed.irecv.
@@ -318,12 +355,16 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"{len(self.transfer_plan.operations)} ranks({self.send_ranks_sample}) "
             f"for rank {self.rank_coordinate}."
         )
+        self._init_weights_exchange_process_group()
         start_time = time.time()
 
         # Build receive ops once for logging, then execute them via
         # batch_send_recv to keep scheduling consistent with the writer.
-        p2p_op_list = nccl_build_recv_ops(
-            self.parameters, self.transfer_plan, self.weights_update_group
+        p2p_op_list, non_contiguous_tensor_pairs, recv_traj_list = nccl_build_recv_ops(
+            self.parameters,
+            self.transfer_plan,
+            self.weights_update_group,
+            self.use_batch_send_recv,
         )
         logger.info(
             f"Reader: Built {len(p2p_op_list)} recv operations from "
@@ -333,12 +374,14 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         logger.info(
             f"Reader: Executing {len(p2p_op_list)} recv ops via batch_send_recv"
         )
-        batch_send_recv(
-            send_ops=[], recv_ops=p2p_op_list, blocking=True, use_group=True
-        )
-        # Some parameters are represented by contiguous recv buffers in
-        # WorkerWeightsReader; sync them back to model views after comm.
-        self._sync_noncontiguous_parameter_views()
+        if self.use_batch_send_recv:
+            batch_send_recv(
+                send_ops=[], recv_ops=p2p_op_list, blocking=True, use_group=True
+            )
+        else:
+            self._send_recv_one_by_one(p2p_op_list, recv_traj_list)
+
+        self._sync_non_contiguous_tensor_pairs(non_contiguous_tensor_pairs)
         device_util.synchronize(device_id=device_util.current_device())
         duration = time.time() - start_time
         logger.info(
@@ -358,6 +401,43 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         logger.info(
             f"Barrier passed for reader step {step_id} with rank {self.transfer_rank}"
         )
+        if p2p_op_list is not None:
+            p2p_op_list.clear()
+            del p2p_op_list
+        self._destroy_weights_exchange_process_group()
+        gc.collect()
+
+    def _send_recv_one_by_one(self, p2p_op_list, recv_traj_list):
+        # it's useful for debug or insufficient memory if infer with closed sleep mode
+        # it's useful for the hardware diff scene which using batch_send_recv will be error,such as 910B2 and 910B1
+        for (param_name, send_rank), op_dist in zip(recv_traj_list, p2p_op_list):
+            logger.debug(
+                f"Reader {self.transfer_rank} start to receive from {send_rank} for {param_name}"
+            )
+            non_contiguous_tensor_pair = None
+            if not op_dist.tensor.is_contiguous():
+                original_tensor = op_dist.tensor
+                op_dist.tensor = original_tensor.contiguous()
+                non_contiguous_tensor_pair = (original_tensor, op_dist.tensor)
+
+            op_task = op_dist.op(
+                op_dist.tensor,
+                group=op_dist.group,
+                tag=op_dist.tag,
+                group_src=op_dist.group_peer,
+            )
+            op_task.wait()
+            if not op_task.is_completed():
+                device_util.synchronize(device_id=device_util.current_device())
+                assert op_task.is_completed()
+            if non_contiguous_tensor_pair is not None:
+                with torch.no_grad():
+                    non_contiguous_tensor_pair[0].copy_(non_contiguous_tensor_pair[1])
+                del non_contiguous_tensor_pair
+                del op_dist.tensor
+            logger.debug(
+                f"Reader {self.transfer_rank} end to receive from {send_rank} for {param_name}"
+            )
 
     def _update_weights_in_colocate_mode(self, step_id, **kwargs):
         assert self.enable_colocate_mode, "Colocate mode is not enabled"
@@ -380,8 +460,6 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             self.parameters,
             step_id=step_id,
         )
-        # Keep model parameter views consistent when recv used contiguous buffers.
-        self._sync_noncontiguous_parameter_views()
         print_current_gpu_status(
             f"after weights update using NCCL for rank {self.rank_coordinate}"
         )

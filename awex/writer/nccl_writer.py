@@ -109,26 +109,20 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         master_info = self.meta_server_client.get_object(
             "master_info", timeout=self.timeout
         )
-        master_address, master_port = master_info
+        self.master_address, self.master_port = master_info
         logger.info(
             f"Get master info from meta server for rank {self.transfer_rank}: {master_info}"
         )
         self._set_device()
-        self.weights_update_group = init_weights_update_group(
-            master_address,
-            master_port,
-            self.transfer_rank,
-            self.transfer_world_size,
-            "weights_exchange",
-            backend=self.comm_backend,
-            role="train",
+        self._init_weights_exchange_process_group()
+        self._shake_hands_with_reader()
+
+        logger.info(
+            f"Finished initializing NCCL weights writer for rank {self.transfer_rank}"
         )
-        logger.info(f"Initialized NCCL weights writer for rank {self.transfer_rank}")
-        # Add a barrier to ensure all processes are ready
-        dist.barrier(
-            group=self.weights_update_group, device_ids=[device_util.current_device()]
-        )
-        logger.info(f"Barrier passed for weights writer with rank {self.transfer_rank}")
+
+    def _shake_hands_with_reader(self):
+
         if self.transfer_rank == self.transfer_world_size - 1:
             logger.info(
                 f"Start to test NCCL ready for rank {self.transfer_rank}, world size {self.transfer_world_size}"
@@ -144,9 +138,6 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         setup_batch_isend_irecv(
             self.weights_update_group, self.transfer_rank, self.transfer_world_size
         )
-        logger.info(
-            f"Finished initializing NCCL weights writer for rank {self.transfer_rank}"
-        )
 
     def _set_device(self):
         device = device_util.current_device()
@@ -158,6 +149,35 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             f"{'/'.join(device_util.visible_devices_env_names())} env is {device_util.visible_devices_env_value() or '(unset)'}"
         )
         device_util.set_device(gpu_id)
+
+    def _init_weights_exchange_process_group(self):
+        if self.already_initialized:
+            return
+
+        self.weights_update_group = init_weights_update_group(
+            master_address=self.master_address,
+            master_port=self.master_port,
+            rank=self.transfer_rank,
+            world_size=self.transfer_world_size,
+            group_name="weights_exchange",
+            backend=self.comm_backend,
+            role="train",
+        )
+        logger.info(f"Initialized NCCL weights writer for rank {self.transfer_rank}")
+        # Add a barrier to ensure all processes are ready
+        dist.barrier(
+            group=self.weights_update_group, device_ids=[device_util.current_device()]
+        )
+        logger.info(f"Barrier passed for weights writer with rank {self.transfer_rank}")
+        self.already_initialized = True
+
+    def _destroy_weights_exchange_process_group(self):
+        # reduce the impact of process group to avoid oom in infer
+        if self.destroy_pg_after_update and self.backend == "hccl":
+            self.already_initialized = False
+            torch.distributed.destroy_process_group(self.weights_update_group)
+            torch.npu.synchronize()
+            torch.npu.empty_cache()
 
     def _init_writer_in_colocate_mode(self):
         self.ipc_backend = self.asystem_train_config.get(
@@ -196,6 +216,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             f"ranks({self.recv_ranks_sample}) from rank {rank_coordinate} "
             f"with {self.num_to_sends} sends"
         )
+        self._init_weights_exchange_process_group()
         start_time = time.time()
         parameters = None
         p2p_op_list = None
@@ -208,8 +229,12 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             logger.info("Writer: Converting parameters completed, building send ops")
             if self.enable_mem_debug:
                 print_current_gpu_status(f"writer-{self.transfer_rank} after convert")
-            p2p_op_list, _ = nccl_build_send_ops(
-                parameters, self.transfer_plan, self.weights_update_group, -1
+            p2p_op_list, _, send_traj_list = nccl_build_send_ops(
+                parameters,
+                self.transfer_plan,
+                self.weights_update_group,
+                -1,
+                self.use_batch_send_recv,
             )
             logger.info(
                 f"Writer: Built {len(p2p_op_list)} send operations to "
@@ -236,9 +261,12 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             logger.info(
                 f"Writer: Executing {len(p2p_op_list)} send ops via batch_send_recv"
             )
-            batch_send_recv(
-                send_ops=p2p_op_list, recv_ops=[], blocking=True, use_group=True
-            )
+            if self.use_batch_send_recv:
+                batch_send_recv(
+                    send_ops=p2p_op_list, recv_ops=[], blocking=True, use_group=True
+                )
+            else:
+                self._send_recv_one_by_one(p2p_op_list, send_traj_list)
             device_util.synchronize(device_id=device_util.current_device())
             if self.enable_mem_debug:
                 print_current_gpu_status(f"writer-{self.transfer_rank} after send")
@@ -267,6 +295,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 p2p_op_list.clear()
             if parameters is not None:
                 parameters.clear()
+            self._destroy_weights_exchange_process_group()
             gc.collect()
             if self.enable_mem_debug:
                 if device_util.get_device_type() == "cuda":
@@ -274,6 +303,27 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 elif device_util.get_device_type() == "npu" and hasattr(torch, "npu"):
                     torch.npu.empty_cache()
                 print_current_gpu_status(f"writer-{self.transfer_rank} after cleanup")
+
+    def _send_recv_one_by_one(self, p2p_op_list, send_traj_list):
+        # it's useful for debug or insufficient memory if infer with closed sleep mode
+        # it's useful for the hardware diff scene which using batch_send_recv will be error,such as 910B2 and 910B1
+        for (param_name, send_rank), op_dist in zip(send_traj_list, p2p_op_list):
+            logger.debug(
+                f"Writer {self.transfer_rank} start to send to {send_rank} for {param_name}"
+            )
+            op_task = op_dist.op(
+                op_dist.tensor,
+                group=op_dist.group,
+                tag=op_dist.tag,
+                group_dst=op_dist.group_peer,
+            )
+            op_task.wait()
+            if not op_task.is_completed():
+                device_util.synchronize(device_id=device_util.current_device())
+                assert op_task.is_completed()
+            logger.debug(
+                f"Writer {self.transfer_rank} end to send from {send_rank} for {param_name}"
+            )
 
     @torch.no_grad()
     def _prepare_params_for_colocate(self):
