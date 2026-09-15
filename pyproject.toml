@@ -3,7 +3,7 @@ requires = ["setuptools>=45", "wheel", "setuptools-scm>=6.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "awex"
+name = "awex-ascend"
 dynamic = ["version"]
 description = "High-performance RL training-inference weight synchronization framework"
 readme = "README.md"
