@@ -48,6 +48,7 @@ class NcclColocateStreamBatchTransport:
             for _ in range(min(self.MAX_STREAMS, world_size))
         ]
 
+    @torch.no_grad()
     def update_weights_in_colocate_mode(
         self,
         train_to_infer_device_mapping,

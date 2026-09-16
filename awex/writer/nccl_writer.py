@@ -33,7 +33,6 @@ from awex.util import device as device_util
 from awex.util.common import compute_statistics, get_ip_address
 from awex.util.gpu import print_current_gpu_status
 from awex.util.process_group import init_weights_update_group, setup_batch_isend_irecv
-from awex.util.system_util import count_open_fds
 from awex.util.tensor_util import (
     cuda_ipc_serialize,
     group_tensors_by_shape_and_dtype,
@@ -179,9 +178,11 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             torch.npu.empty_cache()
 
     def _init_writer_in_colocate_mode(self):
-        self.ipc_backend = "cuda"
-        if device_util.get_device_type() == "npu":
-            self.ipc_backend = "cpu"
+        iec = getattr(self, "infer_engine_config", None)
+        self.ipc_backend = getattr(iec, "weights_exchange_ipc_backend", "cpu")
+        logger.info(
+            f"Func _init_writer_in_colocate_mode got ipc from infer is {self.ipc_backend=}."
+        )
 
         device_phy_ids = [str(i) for i in range(8)]
         visible_env_key = "CUDA_VISIBLE_DEVICES"
@@ -360,90 +361,77 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
 
     @torch.no_grad()
     def _write_weights_in_colocate_mode(self, step_id, **kwargs):
+        rank = self.transfer_rank
         start_time = time.time()
+
         tensors, names = self._prepare_params_for_colocate()
-        num_tensors = len(tensors)
-        if self.ipc_backend in ("cpu", "npu"):
-            tensors = [t.cpu() for t in tensors]
-        logger.info(
-            f"Start to group tensors by shape and dtype for rank {self.transfer_rank}"
-        )
-        # this will copy tensor by concatenate
         group_tensors, metadata = group_tensors_by_shape_and_dtype(tensors)
+
         device_util.synchronize(device_id=device_util.current_device())
-        logger.info(
-            f"Finished grouping tensors by shape and dtype for rank {self.transfer_rank}"
-        )
-        print_current_gpu_status(
-            f"after group_tensors_by_shape_and_dtype for rank {self.transfer_rank}"
-        )
-        logger.info(f"Open fds before serialize: {count_open_fds()}")
 
-        release_tensors(tensors)
         del tensors
-        self.train_engine.release_memory_occupation("weights")
-        self.meta_server_client.add_object_to_set(
-            "all_training_offloaded_weights", self.transfer_rank
-        )
-        print_current_gpu_status(
-            f"after offloaded weights for rank {self.transfer_rank}"
-        )
 
-        if self.ipc_backend in ("cpu", "npu"):
-            group_shared = [tensor.cpu().share_memory_() for tensor in group_tensors]
-            serialized_weights = ipc_serialize((group_shared, metadata, names))
+        if self.ipc_backend == "cpu":
+            group_shared = [t.cpu().share_memory_() for t in group_tensors]
         else:
             group_shared = [
-                tensor.to(device_util.get_torch_device()).share_memory_()
-                for tensor in group_tensors
+                t.to(device_util.get_torch_device()).share_memory_()
+                for t in group_tensors
             ]
+
+        device_util.synchronize(device_id=device_util.current_device())
+
+        if self.ipc_backend != "npu":
+            release_tensors(group_tensors)
+            del group_tensors
+
+        self.train_engine.release_memory_occupation("weights")
+        self.meta_server_client.add_object_to_set(
+            "all_training_offloaded_weights", rank
+        )
+
+        if self.ipc_backend in ("cpu", "npu"):
+            serialized_weights = ipc_serialize((group_shared, metadata, names))
+        else:
             serialized_weights = cuda_ipc_serialize((group_shared, metadata, names))
         device_util.synchronize(device_id=device_util.current_device())
-        logger.info(
-            f"Finished serializing ipc weights with {num_tensors} params, and {len(group_shared)} groups "
-            f"for rank {self.transfer_rank}"
-        )
-        logger.info(f"Open fds after serialize: {count_open_fds()}")
 
         # Put serialized weights to meta server
         ip_address = get_ip_address()
-        # device_id = device_util.current_device()
-        key_suffix = f"_{ip_address}_{self.transfer_rank}_{step_id}"
+        key_suffix = f"_{ip_address}_{rank}_{step_id}"
         serialized_weights_key = f"training_serialized_weights{key_suffix}"
+        update_finished_key = f"weights_update_finished{key_suffix}"
+        write_finished_key = f"write_finished{key_suffix}"
+
         self.meta_server_client.put_object(
             serialized_weights_key,
-            (self.transfer_rank, self.rank_info, serialized_weights),
+            (rank, self.rank_info, serialized_weights),
         )
-        logger.info(
-            f"Put {len(group_shared)} serialized training weights to meta server "
-            f"with key {serialized_weights_key} for step {step_id}"
-        )
-        # Wait for inference engines to finish processing
-        update_finished_key = f"weights_update_finished{key_suffix}"
+
         self.meta_server_client.get_object(update_finished_key, timeout=self.timeout)
         self.meta_server_client.delete_if_exists(update_finished_key)
-        release_tensors(group_tensors)
-        release_tensors(group_shared)
-        del group_tensors
+
+        self.meta_server_client.put_object(write_finished_key, True)
+        self.meta_server_client.delete_if_exists(serialized_weights_key)
+
         del group_shared
+
+        if self.ipc_backend == "npu":
+            del group_tensors
+
         device_util.synchronize(device_id=device_util.current_device())
         gc.collect()
-        if device_util.get_device_type() == "cuda":
+        dev_type = device_util.get_device_type()
+        if dev_type == "cuda":
             torch.cuda.empty_cache()
-        if device_util.get_device_type() == "npu":
+        if dev_type == "npu":
             torch.npu.empty_cache()
-        print_current_gpu_status(
-            f"after clear group_shared for rank {self.transfer_rank}"
-        )
-        write_finished_key = f"write_finished{key_suffix}"
-        self.meta_server_client.put_object(write_finished_key, True)
+
         duration = time.time() - start_time
         compute_statistics(
             self._history_write_weights_time,
             step_id,
             duration,
-            "Send weights using NCCL in colocate mode",
+            "Send weights via IPC share memory in colocate mode",
         )
-        logger.info(
-            f"Finished writing weights in colocate mode for rank {self.transfer_rank}"
-        )
+        logger.info(f"Finished writing weights in colocate mode for rank {rank}")

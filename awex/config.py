@@ -26,7 +26,7 @@ class InferenceConfigValidationError(ValueError):
 
 
 _VALID_COMM_BACKENDS: frozenset = frozenset({"file", "nccl", "hccl", "astate"})
-_VALID_IPC_BACKENDS: frozenset = frozenset({"cpu", "cuda"})
+_VALID_IPC_BACKENDS: frozenset = frozenset({"cpu", "cuda", "npu"})
 
 
 @dataclass

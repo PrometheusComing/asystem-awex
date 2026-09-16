@@ -36,7 +36,6 @@ from awex.models.registry import get_train_weights_converter
 from awex.sharding.param_sharding import (
     get_rank_info_extractor,
 )
-from awex.util import device as device_util
 from awex.util.common import (
     check_train_infer_params_meta,
     compute_statistics,
@@ -117,12 +116,6 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         self.dump_weights_dir_for_validation = self.config.get(
             "dump_weights_dir_for_validation", os.getcwd()
         )
-        if (
-            device_util.get_device_type() == "npu"
-            and self.config.get("weights_exchange_ipc_backend", "cuda") == "cuda"
-        ):
-            logger.info("Switching IPC backend from cuda to cpu for NPU runtime.")
-            self.config["weights_exchange_ipc_backend"] = "cpu"
         logger.info(f"Disable pipeline for weights writer: {self.disable_pipeline}")
         logger.info(f"Env variables for weights writer: {stripped_env_vars()}")
         self.lock = threading.Lock()

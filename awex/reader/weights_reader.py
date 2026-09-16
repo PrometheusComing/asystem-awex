@@ -375,6 +375,13 @@ class WeightsReader(WeightExchangeReader):
                 step_id=step_id,
             )
             if self.enable_colocate_mode:
+                _copy_done_key = f"pre_validate_copy_done_{step_id}"
+                self.meta_server_client.add_object_to_set(
+                    _copy_done_key, self.engine_rank
+                )
+                self.meta_server_client.wait_set_until_size(
+                    _copy_done_key, self.num_engines, self.timeout
+                )
                 self.inference_engine.release_memory_occupation()
             return
         logger.info(f"Start to pre-validate weights for step {step_id}")

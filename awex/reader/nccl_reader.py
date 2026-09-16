@@ -499,7 +499,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             "Receive weights using NCCL",
         )
         ip_address = get_ip_address()
-        # device_id = device_util.current_device()
+
         training_rank = self.infer_to_train_device_mapping[self.transfer_rank]
         key_suffix = f"_{ip_address}_{training_rank}_{step_id}"
         # Signal completion to training process
