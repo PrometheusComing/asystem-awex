@@ -229,9 +229,33 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             torch.npu.empty_cache()
 
     def _init_reader_in_colocate_mode(self):
+        device_phy_ids = [str(i) for i in range(8)]
+        visible_env_key = "CUDA_VISIBLE_DEVICES"
+        if device_util.get_device_type() == "npu":
+            device_phy_ids = [str(i) for i in range(16)]
+            visible_env_key = "ASCEND_RT_VISIBLE_DEVICES"
+
+        def _get_current_phy_id():
+            device_phy_id = os.getenv(visible_env_key)
+            if device_phy_id in device_phy_ids:
+                return device_phy_id
+            ids = device_phy_id.split(",")
+            gpu_id = getattr(self.scheduler, "gpu_id", None) or getattr(
+                self.scheduler, "local_rank", None
+            )
+            if gpu_id is None:
+                gpu_id = int(os.environ.get("LOCAL_RANK", 0))
+            current_phy_id = ids[int(gpu_id)]
+            logger.info(
+                f"_get_current_phy_id:{current_phy_id=} {gpu_id=} {ids=} {os.environ.get('LOCAL_RANK', 0)=}"
+            )
+            return current_phy_id
+
+        device_id = _get_current_phy_id()
+
         self.meta_server_client.add_object_to_set(
             "inference_device_rank_entries",
-            (get_ip_address(), device_util.current_device(), self.transfer_rank),
+            (get_ip_address(), device_id, self.transfer_rank),
         )
         self.meta_server_client.wait_set_until_size(
             "inference_device_rank_entries", self.infer_world_size, timeout=self.timeout
@@ -294,7 +318,8 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         # Get serialized weights from meta server
         ip_address = get_ip_address()
         device_id = device_util.current_device()
-        key = f"training_serialized_weights_{ip_address}_{device_id}_{step_id}"
+        training_rank = self.infer_to_train_device_mapping[self.transfer_rank]
+        key = f"training_serialized_weights_{ip_address}_{training_rank}_{step_id}"
         logger.info(
             f"Start to get serialized ipc weights {key} for rank {self.rank_coordinate}"
         )
@@ -440,6 +465,8 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             )
 
     def _update_weights_in_colocate_mode(self, step_id, **kwargs):
+        import torch.distributed as dist
+
         assert self.enable_colocate_mode, "Colocate mode is not enabled"
         self.collect_training_weights(step_id, **kwargs)
         logger.info(
@@ -472,8 +499,9 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             "Receive weights using NCCL",
         )
         ip_address = get_ip_address()
-        device_id = device_util.current_device()
-        key_suffix = f"_{ip_address}_{device_id}_{step_id}"
+        # device_id = device_util.current_device()
+        training_rank = self.infer_to_train_device_mapping[self.transfer_rank]
+        key_suffix = f"_{ip_address}_{training_rank}_{step_id}"
         # Signal completion to training process
         update_finished_key = f"weights_update_finished{key_suffix}"
         self.meta_server_client.put_object(update_finished_key, True)
@@ -483,11 +511,13 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         logger.info(
             f"Barrier passed for reader step {step_id} with rank {self.transfer_rank}"
         )
+        write_finished_key = f"write_finished{key_suffix}"
+        self.meta_server_client.get_object_then_delete(write_finished_key)
         gc.collect()
         if device_util.get_device_type() == "cuda":
             torch.cuda.empty_cache()
-        write_finished_key = f"write_finished{key_suffix}"
-        self.meta_server_client.get_object_then_delete(write_finished_key)
+        if device_util.get_device_type() == "npu":
+            torch.npu.empty_cache()
         logger.info(
             f"Finished updating weights in colocate mode for rank {self.transfer_rank}"
         )

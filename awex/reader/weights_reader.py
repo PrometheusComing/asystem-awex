@@ -367,11 +367,15 @@ class WeightsReader(WeightExchangeReader):
             return
         model_path = kwargs.get("path")
         if not model_path:
+            if self.enable_colocate_mode:
+                self._resume_weights_memory_occupation()
             # NCCL/IPC path: no disk checkpoint, just snapshot current params and zero them.
             self.inference_engine.execute_task_in_model_worker(
                 self._pre_validate_weights_on_tp_worker,
                 step_id=step_id,
             )
+            if self.enable_colocate_mode:
+                self.inference_engine.release_memory_occupation()
             return
         logger.info(f"Start to pre-validate weights for step {step_id}")
         start_time = time.time()

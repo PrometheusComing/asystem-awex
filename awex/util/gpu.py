@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
+import os
 import subprocess
 
 import torch
@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 def get_gpu_status() -> str:
     """Get accelerator status information in CSV format."""
     if device_util.get_device_type() == "npu":
+        if not os.environ.get("AWEX_PRINT_STATUS_BY_COMMAND", "0") == "1":
+            return "Skip run sub command,run it by using export AWEX_PRINT_STATUS_BY_COMMAND=1."
         try:
             return subprocess.check_output(["npu-smi", "info"], text=True)
         except subprocess.CalledProcessError as e:

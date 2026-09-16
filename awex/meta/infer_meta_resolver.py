@@ -201,7 +201,9 @@ class InferParamMetaResolver(ParamMetaResolver):
         model_context = kwargs["model_context"]
         params_meta = []
         rank_info = get_rank_info_extractor(engine_name)(model_context, engine_rank)
-        model_arch_name = type(model).__name__
+        hf_config = getattr(model, "config", None) or model_context.get("hf_config")
+        arch = getattr(hf_config, "architectures", None) or []
+        model_arch_name = arch[0] if arch else type(model).__name__
         meta = {
             "rank_info": rank_info,
             "params_meta": params_meta,
@@ -210,7 +212,7 @@ class InferParamMetaResolver(ParamMetaResolver):
         sglang_to_hf_weight_converter = get_infer_weights_converter(
             engine_name,
             model_arch_name,
-            hf_config=model.config,
+            hf_config=hf_config,
             infer_engine_config=infer_engine_config,
             rank_info=rank_info,
         )

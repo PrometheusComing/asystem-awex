@@ -222,6 +222,7 @@ class NcclColocateTransport:
         )
 
 
+@torch.no_grad()
 def execute_tensors_to_copy(tensors_to_copy, copy_ops, recv_parameters, stage: str):
     start_time = time.time()
     num_ops = len(copy_ops)
@@ -232,7 +233,12 @@ def execute_tensors_to_copy(tensors_to_copy, copy_ops, recv_parameters, stage: s
     for send_tensor, recv_op in zip(tensors_to_copy, copy_ops):
         recv_tensor = recv_parameters[recv_op.recv_shard_meta.name]
         recv_tensor_sliced = slice_tensor(recv_tensor, recv_op, False)
-        recv_tensor_sliced.copy_(send_tensor)
+        if not recv_tensor_sliced.is_contiguous():
+            dst_slice = recv_tensor_sliced.contiguous()
+            dst_slice.copy_(send_tensor)
+            recv_tensor_sliced.copy_(dst_slice)
+        else:
+            recv_tensor_sliced.copy_(send_tensor)
     duration = time.time() - start_time
     device_util.synchronize(device_id=device_util.current_device())
     logger.info(

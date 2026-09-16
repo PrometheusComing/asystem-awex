@@ -70,6 +70,10 @@ def _get_config_value(config, name: str, default=None):
 def import_model_configs():
     model_arch_name_to_config = {}
     package_name = "awex.models"
+    from transformers.utils.import_utils import is_torch_npu_available
+
+    if is_torch_npu_available():
+        package_name = "awex.models.ascend"
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:

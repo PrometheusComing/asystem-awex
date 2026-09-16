@@ -146,6 +146,8 @@ class AwexVLLMServerAdapter:
         self._call_engine_async("sleep", 1)
 
     def resume_memory_occupation(self, tags=None) -> None:
+        if isinstance(tags, str):
+            tags = [tags]
         logger.info("Resume memory occupation via vLLM wake_up.")
         self._call_engine_async("wake_up", tags)
 
