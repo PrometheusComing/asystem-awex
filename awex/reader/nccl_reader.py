@@ -38,7 +38,11 @@ from awex.util.common import (
 )
 from awex.util.gpu import get_gpu_status, print_current_gpu_status
 from awex.util.system_util import count_open_fds
-from awex.util.tensor_util import reconstruct_ipc_weights
+from awex.util.tensor_util import (
+    cuda_ipc_deserialize,
+    ipc_deserialize,
+    reconstruct_tensors_from_groups,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -305,11 +309,17 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         )
         logger.info(f"Open fds before deserialization: {count_open_fds()}")
         # Deserialize weights into tensors
-        self.deserialized_weights, num_groups = reconstruct_ipc_weights(
-            serialized_weights, ipc_backend=self.ipc_backend, device_id=device_id
-        )
+        if self.ipc_backend in ("cpu", "npu"):
+            group_shared, metadata, names = ipc_deserialize(serialized_weights)
+            group_shared = [t.to(device_id) for t in group_shared]
+        else:
+            group_shared, metadata, names = cuda_ipc_deserialize(serialized_weights)
+        device_util.synchronize(device_id=device_util.current_device())
+        tensors = reconstruct_tensors_from_groups(group_shared, metadata)
+        device_util.synchronize(device_id=device_util.current_device())
+        self.deserialized_weights = dict(zip(names, tensors))
         logger.info(
-            f"Deserialized {len(self.deserialized_weights)} parameters and {num_groups} groups"
+            f"Deserialized {len(self.deserialized_weights)} parameters and {len(group_shared)} groups"
         )
         logger.info(
             f"GPU status after deserialization for rank {self.rank_coordinate}:\n{get_gpu_status()}"
@@ -453,17 +463,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         print_current_gpu_status(
             f"after weights update using NCCL for rank {self.rank_coordinate}"
         )
-        # Dropping the reference is NOT enough: cudaIpcCloseMemHandle runs in
-        # the tensor deleter, which only fires once refcounts/GC actually
-        # release the IPC-imported tensors. If that close lags past the train
-        # side's release+empty_cache+realloc (train acts right after
-        # weights_update_finished), the stale IPC mapping overlaps train's
-        # fresh allocations and either side faults with an illegal memory
-        # access at a drifting location (in reload, resume, or first read).
-        # Force the close to complete BEFORE signalling the train side.
         self.deserialized_weights = None
-        gc.collect()
-        device_util.synchronize()
         duration = time.time() - start_time
         compute_statistics(
             self._history_update_weights_time,

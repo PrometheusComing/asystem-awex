@@ -15,13 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import os
 from typing import List, Tuple
 
 import torch
 from transformers import PretrainedConfig
 
 from awex.converter.weights_converter import append_scale_inv, normalize_scale_inv_name
-from awex.util import device as device_util
 
 
 # all sglang related imports must be local imports to avoid import error if
@@ -62,7 +62,12 @@ class SGlangToHFWeightConverter:
         comm_backend = self._cfg_value(infer_engine_config, "comm_backend", None)
         if isinstance(comm_backend, str) and comm_backend.strip().lower() == "hccl":
             return "npu"
-        return device_util.get_device_type()
+        env_backend = os.environ.get("AWEX_DEVICE_TYPE", "").strip().lower()
+        if env_backend in {"cuda", "npu", "cpu"}:
+            return env_backend
+        if os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
+            return "npu"
+        return "cuda"
 
     def _use_transposed_moe_layout(self, name: str, parameter: torch.Tensor) -> bool:
         if self.device_backend != "npu" or parameter.ndim != 2:
@@ -117,44 +122,27 @@ class SGlangToHFWeightConverter:
                 # Keep fused format
                 return [(name, parameter)]
             else:
-                # Split into separate Q, K, V projections. The fused dim0 is
-                # proportional to num_heads : num_kv_heads : num_kv_heads,
-                # which only degenerates to equal thirds for MHA — GQA models
-                # (num_kv_heads < num_heads) need head-count-weighted sizes.
-                # The ratio is TP-invariant since both head counts are divided
-                # by the same TP degree.
-                num_heads = int(self.total_num_heads)
-                num_kv_heads = int(self.total_kv_heads or num_heads)
-                total_units = num_heads + 2 * num_kv_heads
+                # Split into separate Q, K, V projections
                 shape0 = parameter.shape[0]
-                if (shape0 * num_heads) % total_units != 0 or (
-                    shape0 * num_kv_heads
-                ) % total_units != 0:
-                    raise ValueError(
-                        f"qkv dim0 {shape0} of {name} is not divisible into "
-                        f"q/k/v with num_heads={num_heads}, "
-                        f"num_kv_heads={num_kv_heads}"
-                    )
-                q_size = shape0 * num_heads // total_units
-                kv_size = shape0 * num_kv_heads // total_units
+                stride = shape0 // 3
                 return [
                     (
                         name.replace("qkv_proj", "q_proj").replace(
                             "query_key_value", "q_proj"
                         ),
-                        parameter.narrow(0, 0, q_size),
+                        parameter.narrow(0, 0, stride),
                     ),
                     (
                         name.replace("qkv_proj", "k_proj").replace(
                             "query_key_value", "k_proj"
                         ),
-                        parameter.narrow(0, q_size, kv_size),
+                        parameter.narrow(0, stride, stride),
                     ),
                     (
                         name.replace("qkv_proj", "v_proj").replace(
                             "query_key_value", "v_proj"
                         ),
-                        parameter.narrow(0, q_size + kv_size, kv_size),
+                        parameter.narrow(0, 2 * stride, stride),
                     ),
                 ]
         elif "o_proj" in name or "dense" in name:
